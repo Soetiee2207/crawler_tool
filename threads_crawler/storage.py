@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,6 +48,16 @@ CREATE TABLE IF NOT EXISTS videos (
     config_json TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Bài đã làm video: xóa khỏi kho, chỉ giữ lại dấu vết để crawl lại không bị thêm vào nữa.
+CREATE TABLE IF NOT EXISTS done_posts (
+    code TEXT PRIMARY KEY,
+    username TEXT,
+    query TEXT,
+    like_count INTEGER,
+    video_id INTEGER,
+    done_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 # Cột thêm sau phiên bản đầu; DB cũ được bổ sung khi mở.
@@ -71,23 +83,42 @@ class Store:
         self.videos_dir = data_dir / "videos"
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.videos_dir.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(data_dir / "threads.db", check_same_thread=False)
-        self.db.row_factory = sqlite3.Row
+        self._path = data_dir / "threads.db"
+        self._local = threading.local()
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(posts)")}
         if cols:
             for col, typ in MIGRATIONS.items():
                 if col not in cols:
                     self.db.execute(f"ALTER TABLE posts ADD COLUMN {col} {typ}")
         self.db.executescript(SCHEMA)
+        # Bài đánh dấu "đã dùng" từ phiên bản cũ → chuyển sang cơ chế xóa khỏi kho.
+        used = [r[0] for r in self.db.execute("SELECT code FROM posts WHERE used = 1 AND parent_code IS NULL")]
+        if used:
+            self.archive_used(used)
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """One connection per thread: web server xử lý request song song trên nhiều luồng."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self._path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        self.db.close()
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     # ── Ghi dữ liệu crawl ─────────────────────────────────────────────────────
 
     def save(
         self, post: dict, query: str | None = None, parent_code: str | None = None
     ) -> None:
+        if self.is_done(post["code"]) or (parent_code and self.is_done(parent_code)):
+            return
         # Giữ lại đường dẫn media đã tải và trạng thái đã dùng nếu post được crawl lại.
         old = self.db.execute(
             "SELECT media_json, used, avatar_path FROM posts WHERE code = ?", (post["code"],)
@@ -141,11 +172,26 @@ class Store:
         dest.write_bytes(resp.content)
         return True
 
-    def mark_used(self, codes: list[str], used: bool = True) -> None:
-        self.db.executemany("UPDATE posts SET used = ? WHERE code = ?", [(int(used), c) for c in codes])
-        self.db.commit()
+    def is_done(self, code: str) -> bool:
+        return self.db.execute("SELECT 1 FROM done_posts WHERE code = ?", (code,)).fetchone() is not None
+
+    def archive_used(self, codes: list[str], video_id: int | None = None) -> None:
+        """Bài đã làm video: ghi vào done_posts rồi xóa khỏi kho (cả bình luận và ảnh/video đã tải)."""
+        for code in codes:
+            row = self.db.execute(
+                "SELECT username, query, like_count FROM posts WHERE code = ?", (code,)
+            ).fetchone()
+            self.db.execute(
+                "INSERT OR REPLACE INTO done_posts (code, username, query, like_count, video_id) VALUES (?, ?, ?, ?, ?)",
+                (code, row["username"] if row else None, row["query"] if row else None,
+                 row["like_count"] if row else None, video_id),
+            )
+            self.delete_post(code)
 
     def delete_post(self, code: str) -> None:
+        codes = [r[0] for r in self.db.execute("SELECT code FROM posts WHERE code = ? OR parent_code = ?", (code, code))]
+        for c in codes:  # avatars dùng chung giữa các bài nên giữ lại
+            shutil.rmtree(self.media_dir / c, ignore_errors=True)
         self.db.execute("DELETE FROM posts WHERE code = ? OR parent_code = ?", (code, code))
         self.db.commit()
 
@@ -162,7 +208,6 @@ class Store:
         self,
         query: str | None = None,
         search: str | None = None,
-        used: bool | None = None,
         sort: str = "likes",
         limit: int = 50,
         offset: int = 0,
@@ -174,9 +219,6 @@ class Store:
         if search:
             where.append("(text LIKE ? OR username LIKE ?)")
             args += [f"%{search}%", f"%{search}%"]
-        if used is not None:
-            where.append("used = ?")
-            args.append(int(used))
         order = {
             "likes": "like_count DESC",
             "replies": "reply_count DESC",
@@ -205,9 +247,9 @@ class Store:
         ]
         return post
 
-    def export_json(self, out: Path, query: str | None = None, only_unused: bool = False) -> int:
+    def export_json(self, out: Path, query: str | None = None) -> int:
         """Export root posts (with nested replies) to a JSON file. Returns number of posts exported."""
-        posts, _ = self.list_posts(query=query, used=False if only_unused else None, limit=-1)
+        posts, _ = self.list_posts(query=query, limit=-1)
         result = [self.get_post(p["code"]) for p in posts]
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -225,8 +267,9 @@ class Store:
 
     def list_videos(self) -> list[dict]:
         rows = self.db.execute(
-            """SELECT v.*, p.username, p.query FROM videos v
-               LEFT JOIN posts p ON p.code = v.post_code ORDER BY v.id DESC"""
+            """SELECT v.*, COALESCE(p.username, d.username) AS username, COALESCE(p.query, d.query) AS query
+               FROM videos v LEFT JOIN posts p ON p.code = v.post_code
+               LEFT JOIN done_posts d ON d.code = v.post_code ORDER BY v.id DESC"""
         )
         result = []
         for r in rows:

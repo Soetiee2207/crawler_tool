@@ -6,13 +6,14 @@ import asyncio
 import io
 import logging
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import media, tts, video
+from . import cards, keywords, media, tts, video
 from .crawler import DEFAULT_PROFILE_DIR
 from .jobs import JobManager
 from .pipeline import CrawlOptions, CrawlTarget, crawl
@@ -32,28 +33,34 @@ class CrawlRequest(BaseModel):
     show_browser: bool = False
 
 
-class ScriptRequest(BaseModel):
+class ScriptItem(BaseModel):
     code: str
     reply_codes: list[str] = []
+
+
+class ScriptRequest(BaseModel):
+    items: list[ScriptItem]
     max_lines: int = Field(11, ge=4, le=20)
     with_image: bool = True
 
 
-class SampleRequest(BaseModel):
-    voice: str
-    text: str = "Xin chào các bạn, đây là giọng đọc thử cho video TikTok của mình."
-    precision: str = "fp32"
+class TtsRequest(BaseModel):
+    text: str
+    voice: str = tts.DEFAULT_VOICE
+    precision: Literal["fp32", "int8"] = "fp32"
+    normalize: bool = False  # True = làm sạch text trước (dùng cho câu nghe thử)
 
 
-class UsedRequest(BaseModel):
-    used: bool
+class CardRequest(BaseModel):
+    segment: video.Segment
+    theme: Literal["light", "dark"] = "dark"
 
 
 def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     app = FastAPI(title="Threads → TikTok")
     jobs = JobManager()
     data_dir = data_dir.resolve()
-    store = Store(data_dir)  # sqlite connection dùng chung (check_same_thread=False)
+    store = Store(data_dir)  # mỗi luồng tự mở kết nối sqlite riêng
 
     def with_urls(p: dict) -> dict:
         p["avatar_src"] = media_url(p.get("avatar_path"), data_dir)
@@ -86,6 +93,10 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
 
     # ── Kho bài ──────────────────────────────────────────────────────────────
 
+    @app.get("/api/keywords")
+    def keyword_suggestions():
+        return keywords.suggestions(store)
+
     @app.get("/api/queries")
     def queries():
         return store.list_queries()
@@ -93,9 +104,9 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     @app.get("/api/posts")
     def posts(
         query: str | None = None, q: str | None = None,
-        used: bool | None = None, sort: str = "likes", limit: int = 30, offset: int = 0,
+        sort: str = "likes", limit: int = 30, offset: int = 0,
     ):
-        items, total = store.list_posts(query, q, used, sort, limit, offset)
+        items, total = store.list_posts(query, q, sort, limit, offset)
         return {"items": [with_urls(p) for p in items], "total": total}
 
     @app.get("/api/posts/{code}")
@@ -113,16 +124,17 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
         store.delete_post(code)
         return {"ok": True}
 
-    @app.post("/api/posts/{code}/used")
-    def set_used(code: str, req: UsedRequest):
-        store.mark_used([code], req.used)
-        return {"ok": True}
-
     # ── Tạo video ────────────────────────────────────────────────────────────
 
     @app.get("/api/materials")
     def materials():
-        return media.list_materials()
+        items = media.list_materials()
+        for m in items["memes"]:  # trình phát xem trước cần biết màu phông + kích thước để tự tách nền
+            src = media.safe_material(m["path"], "memes")
+            info = media.probe(src)
+            m |= {"key": media.detect_key_color(src), "width": info["width"], "height": info["height"],
+                  "has_audio": info["has_audio"]}
+        return items
 
     @app.get("/api/materials/thumb/{kind}/{path:path}")
     def material_thumb(kind: str, path: str):
@@ -144,39 +156,46 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     def voices():
         return tts.list_voices()
 
-    @app.post("/api/voices/sample")
-    def voice_sample(req: SampleRequest):
-        wav = tts.synthesize(tts.normalize_for_speech(req.text), req.voice, req.precision)
-        return FileResponse(wav, media_type="audio/wav")
+    @app.post("/api/tts")
+    def synthesize(req: TtsRequest):
+        """Giọng đọc cho một thẻ (có cache). Trả về URL + thời lượng để timeline hiển thị đúng."""
+        text = tts.normalize_for_speech(req.text) if req.normalize else req.text.strip()
+        if not text:
+            raise HTTPException(400, "Lời đọc trống")
+        wav = tts.synthesize(text, req.voice, req.precision)
+        return {"url": f"/tts/{wav.name}", "duration": tts.duration_of(wav)}
 
     @app.post("/api/script")
     def script(req: ScriptRequest):
-        p = store.get_post(req.code)
-        if not p:
-            raise HTTPException(404, "Không tìm thấy bài")
-        return video.build_script(p, req.reply_codes, req.max_lines, req.with_image)
+        segments = []
+        for item in req.items:
+            p = store.get_post(item.code)
+            if not p:
+                raise HTTPException(404, f"Không tìm thấy bài {item.code}")
+            segments += video.build_script(p, item.reply_codes, req.max_lines, req.with_image)
+        return segments
 
-    @app.post("/api/preview")
-    def preview(spec: video.RenderSpec, segment: int = 0):
-        img = video.preview(spec, segment)
-        img.thumbnail((540, 960))
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=85)
-        return Response(buf.getvalue(), media_type="image/jpeg")
+    @app.post("/api/card")
+    def card(req: CardRequest):
+        return png_response(video.card_image(req.segment, req.theme))
+
+    @app.get("/api/text-image")
+    def text_image(text: str):
+        return png_response(cards.render_title(text))
 
     @app.post("/api/render")
-    def start_render(spec: video.RenderSpec):
-        if not spec.segments:
-            raise HTTPException(400, "Kịch bản trống")
+    def start_render(project: video.Project):
+        if not project.segments:
+            raise HTTPException(400, "Timeline chưa có thẻ nào")
 
         def run(progress):
             job_store = Store(data_dir)
             try:
-                return video.render(job_store, spec, progress)
+                return video.render(job_store, project, progress)
             finally:
                 job_store.close()
 
-        label = spec.title.strip() or spec.segments[0].display_text[:40]
+        label = project.name.strip() or project.segments[0].display_text[:40]
         return jobs.submit("render", f"Video: {label}", run)
 
     # ── Video đã xuất ────────────────────────────────────────────────────────
@@ -207,9 +226,17 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
             raise HTTPException(404)
         return job
 
+    tts.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/tts", StaticFiles(directory=tts.CACHE_DIR), name="tts")
     app.mount("/files", StaticFiles(directory=data_dir), name="files")
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
+
+
+def png_response(img) -> Response:
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return Response(buf.getvalue(), media_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
 
 def media_url(path: str | None, data_dir: Path) -> str | None:

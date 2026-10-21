@@ -45,8 +45,19 @@ def _probe(path: str, mtime: float) -> dict:
 
 
 def probe(path: str | Path) -> dict:
+    """ffprobe info, cached in memory and on disk (khởi động lại server không phải đo lại)."""
     p = Path(path)
-    return _probe(str(p), p.stat().st_mtime)
+    mtime = p.stat().st_mtime
+    cached = _thumb_path(p, "probe", "json")
+    if cached.exists():
+        try:
+            return json.loads(cached.read_text())
+        except ValueError:
+            pass
+    info = _probe(str(p), mtime)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text(json.dumps(info))
+    return info
 
 
 def safe_material(rel: str, kind: str) -> Path:
@@ -122,7 +133,20 @@ def background_thumb(src: Path) -> Path:
 
 
 def detect_key_color(src: Path) -> str | None:
-    """Return hex key color (vd "0x00ff00") nếu góc khung hình là phông xanh/xanh dương, else None."""
+    """Return hex key color (vd "0x00ff00") nếu góc khung hình là phông xanh/xanh dương, else None.
+
+    Kết quả được lưu ra file nhỏ: giải mã lại khung hình mỗi lần liệt kê thư viện rất chậm.
+    """
+    cached = _thumb_path(src, "key", "txt")
+    if cached.exists():
+        return cached.read_text().strip() or None
+    key = _detect_key_color(src)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_text(key or "")
+    return key
+
+
+def _detect_key_color(src: Path) -> str | None:
     frame = _thumb_path(src, "keyframe", "png")
     if not frame.exists():
         extract_frame(src, min(0.3, probe(src)["duration"] / 2), frame)

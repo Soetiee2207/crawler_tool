@@ -20,15 +20,18 @@ uv run threads-crawler web          # mở http://127.0.0.1:8000
 ```
 
 - **Crawl**: nhập từ khóa hoặc #hashtag (mỗi dòng một từ khóa).
-- **Kho bài**: lọc theo từ khóa, nội dung, trạng thái đã làm video; xem bài kèm bình luận; bấm "Làm video".
-- **Tạo video**:
-  - Chọn bình luận theo thứ tự đọc. Phần "tác giả viết tiếp" được chọn sẵn.
-  - Sửa chữ trên thẻ và lời đọc.
-  - Chọn giọng đọc, nghe thử, chỉnh tốc độ. Có chế độ Nhanh (int8).
-  - Chọn video nền. Tool chỉ cắt ngẫu nhiên một đoạn vừa đủ thời lượng.
-  - Chọn nhạc nền theo thư mục hoặc từng bài.
-  - Thêm meme: chọn đoạn xuất hiện, độ trễ, vị trí 3×3, kích thước, âm lượng. Phông xanh được tự tách.
-  - Có ảnh xem trước bố cục.
+- **Kho bài**: lọc theo từ khóa, nội dung; xem bài kèm bình luận; bấm "Làm video". Xuất video xong, các bài đã dùng tự động bị xóa khỏi kho và không bị crawl lại.
+- **Kho bài → Tạo video**: tick chọn một hoặc nhiều bài, bấm "🎬 Tạo video mới" (hoặc "➕ Thêm vào video đang làm").
+- **Trình dựng**:
+  - Cột trái: các bài trong video. Bấm vào bình luận để thêm/bớt thẻ. Có thể đổi thứ tự bài hoặc bỏ bài.
+  - Giữa: trình phát xem trước. Bấm ▶ hoặc Space để nghe giọng đọc, nhạc, meme cùng video nền; bấm lên thước thời gian để tua.
+  - Phải: thuộc tính của mục đang chọn (chữ trên thẻ, lời đọc, vị trí/kích thước meme, nhạc, video nền). Khi không chọn gì thì hiện cài đặt giọng đọc, tốc độ, kiểu thẻ.
+  - Timeline gồm các hàng Chữ, Thẻ + giọng, Meme, Nhạc, Nền:
+    - Kéo thẻ để đổi thứ tự; kéo mép phải của thẻ để giữ thẻ lâu hơn.
+    - Kéo meme từ thư viện thả vào timeline; kéo meme, chữ, nhạc để dời; kéo mép phải để đổi độ dài.
+    - Meme và chữ gắn theo thẻ: đổi thứ tự thẻ thì chúng đi theo.
+  - Giọng đọc được tạo dần ở nền. Thẻ "≈" là thời lượng ước tính, "🔊" là đã có giọng thật.
+  - Ctrl+Z để hoàn tác, Delete để xóa mục đang chọn. Dự án được lưu tự động trong trình duyệt.
 - **Video đã xuất**: xem, tải về, xóa.
 
 Thư mục `materials/`:
@@ -44,13 +47,13 @@ materials/meme_video/<thư mục>/*.mp4        meme, phông xanh/xanh dương đ
 ```bash
 uv run threads-crawler login                       # chỉ cần nếu Threads bắt đăng nhập
 uv run threads-crawler search "chuyện công sở" "#tamsu" -n 30 -r 10 --min-likes 100
-uv run threads-crawler export -o data/export.json --unused
+uv run threads-crawler export -o data/export.json
 uv run threads-crawler mark-used <code> [<code> ...]
 ```
 
 ## Dữ liệu
 
-- `data/threads.db`: bảng `posts`. `parent_code` NULL là bài gốc; khác NULL là reply. Cột `used` đánh dấu bài đã làm video.
+- `data/threads.db`: bảng `posts`. `parent_code` NULL là bài gốc; khác NULL là reply. Bài đã làm video được tự động xóa khỏi `posts` (kèm bình luận và media đã tải) và ghi vào bảng `done_posts`, để lần crawl sau không thêm lại.
 - `data/media/<code>/`: ảnh/video đã tải.
 - `data/videos/`: video đã xuất (`.mp4` + ảnh bìa `.jpg`), danh sách lưu ở bảng `videos`.
 - `data/export.json`: dữ liệu xuất ra dạng JSON.

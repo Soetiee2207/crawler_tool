@@ -36,13 +36,13 @@ async def cmd_search(args: argparse.Namespace) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> None:
-    n = Store(args.data).export_json(args.out, query=args.query, only_unused=args.unused)
+    n = Store(args.data).export_json(args.out, query=args.query)
     print(f"Đã xuất {n} bài vào {args.out}")
 
 
 def cmd_mark_used(args: argparse.Namespace) -> None:
-    Store(args.data).mark_used(args.codes)
-    print(f"Đã đánh dấu {len(args.codes)} bài là đã dùng")
+    Store(args.data).archive_used(args.codes)
+    print(f"Đã xóa {len(args.codes)} bài khỏi kho (đánh dấu đã làm video)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,9 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("export", help="Xuất dữ liệu ra JSON (bài gốc kèm replies)")
     e.add_argument("-o", "--out", type=Path, default=Path("data/export.json"))
     e.add_argument("-q", "--query", help="Chỉ xuất bài của từ khóa này")
-    e.add_argument("--unused", action="store_true", help="Chỉ xuất bài chưa dùng làm video")
 
-    m = sub.add_parser("mark-used", help="Đánh dấu bài đã dùng làm video")
+    m = sub.add_parser("mark-used", help="Đánh dấu bài đã làm video (xóa khỏi kho)")
     m.add_argument("codes", nargs="+", help="Mã bài (code)")
     return parser
 

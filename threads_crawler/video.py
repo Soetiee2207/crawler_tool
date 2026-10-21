@@ -1,9 +1,16 @@
-"""Build a TikTok video (1080x1920) from a Threads post: script -> TTS -> cards -> ffmpeg."""
+"""Build a TikTok video (1080x1920) from a timeline project: script -> TTS -> cards -> ffmpeg.
+
+Mốc thời gian (phải khớp với `computeTimeline` trong static/app.js):
+- Các thẻ (segment) nối tiếp nhau trên hàng giọng đọc: bắt đầu sau LEAD_IN, mỗi thẻ dài
+  = thời lượng giọng đọc / tốc độ + `hold`, giữa hai thẻ nghỉ `gap` giây.
+- Meme và chữ gắn (anchor) vào một thẻ: start = start của thẻ đó + offset. Đổi thứ tự thẻ thì
+  meme/chữ đi theo.
+- Nhạc tính theo giây tuyệt đối trên video.
+"""
 
 from __future__ import annotations
 
 import logging
-import random
 import shutil
 import subprocess
 import uuid
@@ -23,12 +30,12 @@ log = logging.getLogger(__name__)
 
 W, H = 1080, 1920
 FPS = 30
-TITLE_Y = 150
+TEXT_TOP = 150  # chữ ở vị trí "trên"
+CARD_TOP = 300  # thẻ được canh giữa trong dải [CARD_TOP, H - SAFE_BOTTOM]
 SAFE_BOTTOM = 300  # vùng caption/nút của TikTok
-LEAD_IN = 0.35  # giây im lặng trước câu đầu
-GAP = 0.35  # giây nghỉ giữa các đoạn
-TAIL = 0.9  # giây giữ hình sau câu cuối
-SILENT_SEGMENT = 2.5  # đoạn không có lời đọc vẫn hiện bấy nhiêu giây
+LEAD_IN = 0.35  # giây im lặng trước thẻ đầu
+TAIL = 0.9  # giây giữ hình sau thẻ cuối
+SILENT_SEGMENT = 2.5  # thẻ không có lời đọc vẫn hiện bấy nhiêu giây
 WORK_DIR = PROJECT_ROOT / ".cache" / "render"
 
 Position = Literal[
@@ -38,7 +45,13 @@ Position = Literal[
 ]
 
 
+def new_id() -> str:
+    return uuid.uuid4().hex[:8]
+
+
 class Segment(BaseModel):
+    id: str = Field(default_factory=new_id)
+    post_code: str = ""
     kind: Literal["post", "reply"] = "post"
     code: str = ""
     username: str
@@ -47,35 +60,65 @@ class Segment(BaseModel):
     reply_to: str | None = None
     display_text: str
     read_text: str = ""
-    likes: int | None = None
+    published_at: str | None = None
+    likes: int | None = None  # None = ẩn thanh tương tác (các trang trước của một bài dài)
     replies: int | None = None
+    reposts: int | None = None
     image_path: str | None = None
     page_label: str | None = None
+    hold: float = Field(0.0, ge=0, le=60)  # giữ thẻ thêm sau khi đọc xong
 
 
-class MemeSpec(BaseModel):
+class Anchor(BaseModel):
+    seg: str | None = None  # id thẻ; None = tính từ đầu video
+    offset: float = 0.0
+
+
+class MemeItem(BaseModel):
+    id: str = Field(default_factory=new_id)
     path: str  # tương đối trong materials/meme_video
-    segment: int = 0  # xuất hiện khi đoạn số `segment` bắt đầu...
-    offset: float = 0.0  # ...cộng thêm bấy nhiêu giây
+    anchor: Anchor = Anchor()
+    duration: float | None = Field(None, gt=0)  # None = cả meme
     position: Position = "bottom-right"
     size: float = Field(0.4, ge=0.1, le=1.0)  # tỉ lệ so với chiều ngang khung hình
     volume: float = Field(1.0, ge=0, le=2)
     chroma: bool | None = None  # None = tự phát hiện phông xanh
 
 
-class RenderSpec(BaseModel):
-    post_code: str
+class TextItem(BaseModel):
+    id: str = Field(default_factory=new_id)
+    text: str
+    anchor: Anchor = Anchor()
+    duration: float | None = Field(None, gt=0)  # None = đến hết video
+    position: Literal["top", "middle", "bottom"] = "top"
+
+
+class MusicItem(BaseModel):
+    id: str = Field(default_factory=new_id)
+    path: str  # tương đối trong materials/background_musics
+    start: float = Field(0.0, ge=0)
+    end: float | None = None  # None = đến hết video
+    volume: float = Field(0.15, ge=0, le=1)
+
+
+class Background(BaseModel):
+    path: str  # tương đối trong materials/background_videos
+    start: float = Field(0.0, ge=0)  # bắt đầu lấy từ giây này của video nền
+
+
+class Project(BaseModel):
+    name: str = ""
+    post_codes: list[str] = []
     segments: list[Segment]
+    texts: list[TextItem] = []
+    memes: list[MemeItem] = []
+    music: list[MusicItem] = []
+    background: Background
     voice: str = tts.DEFAULT_VOICE
     precision: Literal["fp32", "int8"] = "fp32"
     speed: float = Field(1.1, ge=0.7, le=1.8)
-    voice_volume: float = Field(1.0, ge=0, le=2)
-    theme: Literal["light", "dark"] = "light"
-    title: str = ""
-    background: str = "random"  # đường dẫn trong materials/background_videos hoặc "random"
-    music: str = ""  # đường dẫn, "random:<thư mục>" hoặc "" (không nhạc)
-    music_volume: float = Field(0.15, ge=0, le=1)
-    memes: list[MemeSpec] = []
+    gap: float = Field(0.35, ge=0, le=5)
+    theme: Literal["light", "dark"] = "dark"
 
 
 # ── Kịch bản ─────────────────────────────────────────────────────────────────
@@ -93,9 +136,12 @@ def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_i
     def add(p: dict, kind: str) -> None:
         is_continuation = kind == "reply" and p["username"] == post["username"]
         image = first_image(p) if with_image else None
-        pages = cards.paginate(p["text"], max_lines - (5 if image else 0)) if p["text"].strip() else [""]
+        width = cards.POST_TEXT_W if kind == "post" else cards.COMMENT_TEXT_W
+        pages = cards.paginate(p["text"], max_lines - (5 if image else 0), width) if p["text"].strip() else [""]
+        last = len(pages) - 1
         for i, page in enumerate(pages):
             segments.append(Segment(
+                post_code=post["code"],
                 kind=kind,
                 code=p["code"],
                 username=p["username"],
@@ -104,8 +150,10 @@ def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_i
                 reply_to=None if (kind == "post" or is_continuation) else p.get("reply_to_username"),
                 display_text=page,
                 read_text=tts.normalize_for_speech(page),
-                likes=p["like_count"] if kind == "post" and i == 0 else None,
-                replies=p["reply_count"] if kind == "post" and i == 0 else None,
+                published_at=p.get("published_at"),
+                likes=p["like_count"] if i == last else None,  # thanh tương tác ở trang cuối, như Threads
+                replies=p["reply_count"] if i == last else None,
+                reposts=p["repost_count"] if i == last else None,
                 image_path=image if i == 0 else None,
                 page_label=f"{i + 1}/{len(pages)}" if len(pages) > 1 else None,
             ))
@@ -117,22 +165,26 @@ def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_i
     return segments
 
 
-# ── Bố cục (dùng chung cho xem trước và render) ──────────────────────────────
+# ── Bố cục & mốc thời gian ───────────────────────────────────────────────────
 
 
 def card_image(seg: Segment, theme: str) -> Image.Image:
     return cards.render_card(
-        seg.username, seg.display_text, avatar_path=seg.avatar_path, verified=seg.verified,
-        reply_to=seg.reply_to, likes=seg.likes, replies=seg.replies, image_path=seg.image_path,
+        seg.username, seg.display_text, style="post" if seg.kind == "post" else "comment",
+        avatar_path=seg.avatar_path, verified=seg.verified, published_at=seg.published_at,
+        likes=seg.likes, replies=seg.replies, reposts=seg.reposts, image_path=seg.image_path,
         page_label=seg.page_label, theme=theme,
     )
 
 
-def card_xy(card: Image.Image, title_h: int) -> tuple[int, int]:
-    top = TITLE_Y + title_h + 30 if title_h else 200
-    bottom = H - SAFE_BOTTOM
-    y = top + max(0, (bottom - top - card.height) // 2)
-    return (W - card.width) // 2, y
+def card_xy(card: Image.Image) -> tuple[int, int]:
+    band = H - SAFE_BOTTOM - CARD_TOP
+    return (W - card.width) // 2, CARD_TOP + max(0, (band - card.height) // 2)
+
+
+def text_xy(img: Image.Image, position: str) -> tuple[int, int]:
+    y = {"top": TEXT_TOP, "middle": (H - img.height) // 2, "bottom": H - SAFE_BOTTOM - img.height}[position]
+    return (W - img.width) // 2, y
 
 
 def meme_size(src: Path, frac: float) -> tuple[int, int]:
@@ -149,198 +201,182 @@ def meme_xy(position: str, w: int, h: int) -> tuple[int, int]:
     return x, y
 
 
-def resolve_background(spec: RenderSpec) -> Path:
-    if spec.background and spec.background != "random":
-        return media.safe_material(spec.background, "backgrounds")
-    items = media.list_materials()["backgrounds"]
-    if not items:
-        raise RuntimeError("Chưa có video nền trong materials/background_videos")
-    return media.safe_material(random.choice(items)["path"], "backgrounds")
-
-
-def resolve_music(spec: RenderSpec) -> Path | None:
-    if not spec.music:
-        return None
-    if spec.music.startswith("random:"):
-        cat = spec.music.split(":", 1)[1]
-        items = [m for m in media.list_materials()["music"] if not cat or m["category"] == cat]
-        return media.safe_material(random.choice(items)["path"], "music") if items else None
-    return media.safe_material(spec.music, "music")
-
-
-def meme_key(m: MemeSpec, src: Path) -> str | None:
+def meme_key(m: MemeItem, src: Path) -> str | None:
     if m.chroma is False:
         return None
     key = media.detect_key_color(src)
     return key or ("0x00ff00" if m.chroma else None)
 
 
-def preview(spec: RenderSpec, segment: int = 0) -> Image.Image:
-    """Single-frame mockup of the layout (nền + tiêu đề + thẻ + meme) — nhanh, không cần TTS."""
-    frame = media.background_frame(resolve_background(spec))
-    title_h = 0
-    if spec.title.strip():
-        t = cards.render_title(spec.title)
-        frame.alpha_composite(t, ((W - t.width) // 2, TITLE_Y))
-        title_h = t.height
-    if spec.segments:
-        seg = spec.segments[min(segment, len(spec.segments) - 1)]
-        c = card_image(seg, spec.theme)
-        frame.alpha_composite(c, card_xy(c, title_h))
-    for m in spec.memes:
-        src = media.safe_material(m.path, "memes")
-        w, h = meme_size(src, m.size)
-        tmp = WORK_DIR / "preview" / f"{src.stem}.png"
-        media.extract_frame(src, media.probe(src)["duration"] * 0.4, tmp)
-        img = Image.open(tmp)
-        key = meme_key(m, src)
-        img = (media.key_out(img, key) if key else img.convert("RGBA")).resize((w, h), Image.LANCZOS)
-        frame.alpha_composite(img, meme_xy(m.position, w, h))
-    return frame.convert("RGB")
+class Timeline:
+    """Absolute start/end of every segment and item, given real voice durations (giây, tốc độ 1.0)."""
+
+    def __init__(self, project: Project, voice_durations: dict[str, float]) -> None:
+        self.seg: dict[str, tuple[float, float]] = {}
+        t = LEAD_IN
+        for s in project.segments:
+            voice = voice_durations.get(s.id)
+            length = (voice / project.speed if voice else SILENT_SEGMENT) + s.hold
+            self.seg[s.id] = (t, t + length)
+            t += length + project.gap
+        self.segments_end = t - project.gap if project.segments else LEAD_IN
+
+        ends = [self.segments_end + TAIL]
+        self.memes: dict[str, tuple[float, float]] = {}
+        for m in project.memes:
+            src = media.safe_material(m.path, "memes")
+            full = media.probe(src)["duration"]
+            st = self.at(m.anchor)
+            self.memes[m.id] = (st, st + min(m.duration or full, full))
+            ends.append(self.memes[m.id][1])
+        for x in project.texts:
+            if x.duration:
+                ends.append(self.at(x.anchor) + x.duration)
+        self.total = max(ends)
+        self.texts = {
+            x.id: (self.at(x.anchor), min(self.total, self.at(x.anchor) + x.duration) if x.duration else self.total)
+            for x in project.texts
+        }
+
+    def at(self, anchor: Anchor) -> float:
+        base = self.seg[anchor.seg][0] if anchor.seg in self.seg else 0.0
+        return max(0.0, base + anchor.offset)
 
 
 # ── Render ───────────────────────────────────────────────────────────────────
 
 
 def render(
-    store: Store, spec: RenderSpec, on_progress: Callable[[float, str], None] = lambda f, m: None
+    store: Store, project: Project, on_progress: Callable[[float, str], None] = lambda f, m: None
 ) -> dict:
-    if not spec.segments:
-        raise ValueError("Kịch bản trống")
+    if not project.segments:
+        raise ValueError("Timeline chưa có thẻ nào")
     work = WORK_DIR / uuid.uuid4().hex[:10]
     work.mkdir(parents=True, exist_ok=True)
     try:
-        return _render(store, spec, work, on_progress)
+        return _render(store, project, work, on_progress)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _render(store: Store, spec: RenderSpec, work: Path, on_progress) -> dict:
-    # 1. Giọng đọc cho từng đoạn
-    clips: list[np.ndarray | None] = []
-    sr = None
-    for i, seg in enumerate(spec.segments):
-        on_progress(0.6 * i / len(spec.segments), f"Tạo giọng đọc đoạn {i + 1}/{len(spec.segments)}")
-        text = seg.read_text.strip()
-        if not text:
-            clips.append(None)
-            continue
-        audio, rate = sf.read(tts.synthesize(text, spec.voice, spec.precision), dtype="float32")
-        if sr and rate != sr:
-            raise RuntimeError("Các đoạn giọng đọc khác sample rate")
-        sr = rate
-        clips.append(audio if audio.ndim == 1 else audio.mean(axis=1))
-    sr = sr or 48_000
+def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
+    # 1. Giọng đọc (đã cache nếu giao diện tạo trước)
+    clips: dict[str, np.ndarray] = {}
+    sr = 48_000
+    for i, seg in enumerate(p.segments):
+        on_progress(0.5 * i / len(p.segments), f"Giọng đọc thẻ {i + 1}/{len(p.segments)}")
+        if seg.read_text.strip():
+            audio, sr = sf.read(tts.synthesize(seg.read_text.strip(), p.voice, p.precision), dtype="float32")
+            clips[seg.id] = audio if audio.ndim == 1 else audio.mean(axis=1)
+    tl = Timeline(p, {k: len(v) / sr for k, v in clips.items()})
+    total = tl.total
 
-    # 2. Ghép thành một track, ghi lại mốc thời gian mỗi đoạn (tính theo tốc độ đọc)
-    parts = [np.zeros(int(LEAD_IN * spec.speed * sr), np.float32)]
-    starts: list[float] = []
-    pos = len(parts[0])
-    for clip in clips:
-        starts.append(pos / sr / spec.speed)
-        clip = clip if clip is not None else np.zeros(int(SILENT_SEGMENT * spec.speed * sr), np.float32)
-        gap = np.zeros(int(GAP * spec.speed * sr), np.float32)
-        parts += [clip, gap]
-        pos += len(clip) + len(gap)
+    # 2. Track giọng đọc: đặt từng clip ở vị trí (thời gian video × tốc độ) rồi atempo về đúng tốc độ
+    voice = np.zeros(int((total * p.speed + 1) * sr), np.float32)
+    for seg_id, clip in clips.items():
+        pos = int(tl.seg[seg_id][0] * p.speed * sr)
+        voice[pos:pos + len(clip)] += clip[: len(voice) - pos]
     voice_path = work / "voice.wav"
-    sf.write(voice_path, np.concatenate(parts), sr)
-    total = pos / sr / spec.speed + TAIL
-    ends = starts[1:] + [total]
+    sf.write(voice_path, voice, sr)
 
-    # 3. Hình: tiêu đề + thẻ
-    on_progress(0.62, "Vẽ thẻ bài viết")
-    title_h = 0
-    title_png = None
-    if spec.title.strip():
-        t = cards.render_title(spec.title)
-        title_png, title_h = work / "title.png", t.height
-        t.save(title_png)
+    # 3. Hình: thẻ + chữ
+    on_progress(0.52, "Vẽ thẻ và chữ")
+    starts = [tl.seg[s.id][0] for s in p.segments]
+    shows = list(zip(starts, starts[1:] + [total]))  # thẻ hiện đến khi thẻ sau bắt đầu
     card_pngs = []
-    for i, seg in enumerate(spec.segments):
-        c = card_image(seg, spec.theme)
+    for i, seg in enumerate(p.segments):
+        c = card_image(seg, p.theme)
         path = work / f"card_{i:03d}.png"
         c.save(path)
-        card_pngs.append((path, card_xy(c, title_h)))
+        card_pngs.append((path, card_xy(c)))
+    text_pngs = []
+    for k, x in enumerate(p.texts):
+        if not x.text.strip():
+            continue
+        img = cards.render_title(x.text)
+        path = work / f"text_{k:03d}.png"
+        img.save(path)
+        text_pngs.append((path, text_xy(img, x.position), tl.texts[x.id]))
 
     # 4. Lệnh ffmpeg
-    bg = resolve_background(spec)
+    bg = media.safe_material(p.background.path, "backgrounds")
     bg_dur = media.probe(bg)["duration"]
-    music = resolve_music(spec)
-
     inputs: list[list[str]] = []
 
     def add_input(*args: str) -> int:
         inputs.append(list(args))
         return len(inputs) - 1
 
-    if bg_dur > total + 1:
-        bg_start = random.uniform(0, bg_dur - total - 0.5)  # chỉ lấy một đoạn ngẫu nhiên vừa đủ dài
+    if bg_dur > total + 0.5:
+        bg_start = min(p.background.start, bg_dur - total - 0.5)
         i_bg = add_input("-ss", f"{bg_start:.2f}", "-t", f"{total + 0.5:.2f}", "-i", str(bg))
     else:
         bg_start = 0.0
         i_bg = add_input("-stream_loop", "-1", "-t", f"{total + 0.5:.2f}", "-i", str(bg))
     i_voice = add_input("-i", str(voice_path))
-    i_music = add_input("-stream_loop", "-1", "-i", str(music)) if music else None
 
-    filters = [
-        f"[{i_bg}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]"
-    ]
-    cur = "v0"
-    n = 0
+    filters = [f"[{i_bg}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]"]
+    cur, n = "v0", 0
 
-    def overlay(src_label: str, x: int, y: int, extra: str = "") -> None:
+    def overlay(src: str, x: int, y: int, extra: str = "") -> None:
         nonlocal cur, n
         n += 1
-        filters.append(f"[{cur}][{src_label}]overlay={x}:{y}{extra}[v{n}]")
+        filters.append(f"[{cur}][{src}]overlay={x}:{y}{extra}[v{n}]")
         cur = f"v{n}"
 
-    if title_png:
-        i_t = add_input("-i", str(title_png))
-        overlay(f"{i_t}:v", (W - Image.open(title_png).width) // 2, TITLE_Y)
-    for (path, (x, y)), a, b in zip(card_pngs, starts, ends):
-        i_c = add_input("-i", str(path))
-        overlay(f"{i_c}:v", x, y, f":enable='between(t,{a:.3f},{b:.3f})'")
+    for (path, (x, y)), (a, b) in zip(card_pngs, shows):
+        overlay(f"{add_input('-i', str(path))}:v", x, y, f":enable='between(t,{a:.3f},{b:.3f})'")
 
-    audio_labels = []
-    filters.append(f"[{i_voice}:a]atempo={spec.speed:.3f},volume={spec.voice_volume:.2f},apad[voice]")
-    audio_labels.append("voice")
-    if i_music is not None:
-        filters.append(
-            f"[{i_music}:a]volume={spec.music_volume:.3f},afade=t=in:d=0.8,"
-            f"afade=t=out:st={max(0, total - 2):.2f}:d=2[music]"
-        )
-        audio_labels.append("music")
-
-    for k, m in enumerate(spec.memes):
-        src = media.safe_material(m.path, "memes")
-        info = media.probe(src)
-        w, h = meme_size(src, m.size)
-        x, y = meme_xy(m.position, w, h)
-        st = starts[min(m.segment, len(starts) - 1)] + m.offset
+    audio = [f"[{i_voice}:a]atempo={p.speed:.3f}[voice]"]
+    labels = ["voice"]
+    for k, m in enumerate(p.memes):
+        st, en = tl.memes[m.id]
         if st >= total:
             continue
+        src = media.safe_material(m.path, "memes")
+        w, h = meme_size(src, m.size)
+        x, y = meme_xy(m.position, w, h)
         i_m = add_input("-i", str(src))
-        key = meme_key(m, src)
-        chain = f"[{i_m}:v]"
-        if key:
-            chain += f"chromakey={key}:0.16:0.08,"
-            kr, kg, kb = int(key[2:4], 16), int(key[4:6], 16), int(key[6:8], 16)
-            chain += f"despill=type={'green' if kg >= kb else 'blue'},"
-        chain += f"scale={w}:{h},setpts=PTS-STARTPTS+{st:.3f}/TB[m{k}]"
+        chain = f"[{i_m}:v]trim=0:{en - st:.3f},setpts=PTS-STARTPTS,"
+        if key := meme_key(m, src):
+            kg, kb = int(key[4:6], 16), int(key[6:8], 16)
+            chain += f"chromakey={key}:0.16:0.08,despill=type={'green' if kg >= kb else 'blue'},"
+        chain += f"scale={w}:{h},setpts=PTS+{st:.3f}/TB[m{k}]"
         filters.append(chain)
         overlay(f"m{k}", x, y, ":eof_action=pass")
-        if info["has_audio"] and m.volume > 0:
-            ms = int(st * 1000)
-            filters.append(f"[{i_m}:a]adelay={ms}:all=1,volume={m.volume:.2f}[ma{k}]")
-            audio_labels.append(f"ma{k}")
+        if media.probe(src)["has_audio"] and m.volume > 0:
+            audio.append(
+                f"[{i_m}:a]atrim=0:{en - st:.3f},asetpts=PTS-STARTPTS,volume={m.volume:.2f},"
+                f"adelay={int(st * 1000)}:all=1[ma{k}]"
+            )
+            labels.append(f"ma{k}")
 
+    for path, (x, y), (a, b) in text_pngs:  # chữ nằm trên cùng
+        overlay(f"{add_input('-i', str(path))}:v", x, y, f":enable='between(t,{a:.3f},{b:.3f})'")
+
+    for k, mu in enumerate(p.music):
+        st = min(mu.start, total)
+        en = min(mu.end if mu.end is not None else total, total)
+        if en - st < 0.3:
+            continue
+        i_mu = add_input("-stream_loop", "-1", "-i", str(media.safe_material(mu.path, "music")))
+        d = en - st
+        audio.append(
+            f"[{i_mu}:a]atrim=0:{d:.3f},asetpts=PTS-STARTPTS,volume={mu.volume:.3f},"
+            f"afade=t=in:d={min(0.8, d / 4):.2f},afade=t=out:st={max(0, d - 1.5):.2f}:d={min(1.5, d / 3):.2f},"
+            f"adelay={int(st * 1000)}:all=1[mu{k}]"
+        )
+        labels.append(f"mu{k}")
+
+    filters += audio
     filters.append(
-        "".join(f"[{a}]" for a in audio_labels)
-        + f"amix=inputs={len(audio_labels)}:duration=first:normalize=0,alimiter=limit=0.95[aout]"
+        "".join(f"[{a}]" for a in labels)
+        + f"amix=inputs={len(labels)}:duration=longest:normalize=0,alimiter=limit=0.95[aout]"
     )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out = store.videos_dir / f"{stamp}_{spec.post_code}.mp4"
+    first_code = p.post_codes[0] if p.post_codes else (p.segments[0].post_code or "video")
+    out = store.videos_dir / f"{stamp}_{first_code}.mp4"
     cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1"]
     for args in inputs:
         cmd += args
@@ -351,20 +387,21 @@ def _render(store: Store, spec: RenderSpec, work: Path, on_progress) -> dict:
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart", str(out),
     ]
     (work / "ffmpeg_cmd.txt").write_text(" ".join(cmd))
-    _run_ffmpeg(cmd, total, work, lambda f: on_progress(0.65 + 0.33 * f, f"Dựng video {int(f * 100)}%"))
+    _run_ffmpeg(cmd, total, work, lambda f: on_progress(0.55 + 0.43 * f, f"Dựng video {int(f * 100)}%"))
 
     thumb = out.with_suffix(".jpg")
     media.run(["ffmpeg", "-y", "-v", "error", "-ss", "1", "-i", str(out), "-frames:v", "1",
                "-vf", "scale=360:-2", str(thumb)])
-    config = spec.model_dump(exclude={"segments"}) | {
-        "background_file": str(bg.relative_to(media.MATERIALS_DIR)),
+    config = p.model_dump(include={"voice", "precision", "speed", "theme", "post_codes"}) | {
+        "background_file": p.background.path,
         "background_start": round(bg_start, 2),
-        "music_file": str(music.relative_to(media.MATERIALS_DIR)) if music else None,
-        "segments": len(spec.segments),
+        "music_file": p.music[0].path if p.music else None,
+        "segments": len(p.segments),
+        "memes": len(p.memes),
     }
-    title = spec.title.strip() or spec.segments[0].display_text[:80]
-    video_id = store.add_video(spec.post_code, title, out, thumb, round(total, 2), config)
-    store.mark_used([spec.post_code])
+    title = p.name.strip() or next((x.text for x in p.texts if x.text.strip()), "") or p.segments[0].display_text[:80]
+    video_id = store.add_video(first_code, title, out, thumb, round(total, 2), config)
+    store.archive_used(p.post_codes or [first_code], video_id)
     on_progress(1.0, "Xong")
     return {"id": video_id, "path": str(out), "duration": total}
 

@@ -62,6 +62,10 @@ async def crawl(
                 posts = [p for p in posts if p["like_count"] >= opts.min_likes]
                 log.info("'%s': %d bài (>= %d likes)", target.query, len(posts), opts.min_likes)
 
+                done = [p for p in posts if store.is_done(p["code"])]
+                if done:
+                    log.info("'%s': bỏ qua %d bài đã làm video", target.query, len(done))
+                    posts = [p for p in posts if p not in done]
                 for i, post in enumerate(posts, 1):
                     on_progress(base + span * i / (len(posts) + 1), f"'{target.query}': bài {i}/{len(posts)}")
                     replies = []

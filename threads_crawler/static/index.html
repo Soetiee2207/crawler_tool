@@ -24,6 +24,7 @@
 <main>
   <!-- ─────────────── CRAWL ─────────────── -->
   <section id="tab-crawl" class="tab active">
+    <div class="crawl-grid">
     <div class="panel crawl-panel">
       <h2>Từ khóa</h2>
       <label class="field">
@@ -48,6 +49,20 @@
         <button id="startCrawl" class="primary">Bắt đầu crawl</button>
       </div>
     </div>
+
+      <div class="panel suggest-panel">
+        <div class="panel-head">
+          <h2>Gợi ý từ khóa</h2>
+          <span class="muted small">Bấm để thêm/bớt vào danh sách</span>
+        </div>
+        <div id="suggestTabs" class="suggest-tabs"></div>
+        <div id="suggestBody" class="chips"></div>
+        <h3>Hashtag hay gặp trong bài đã crawl</h3>
+        <div id="suggestData" class="chips small"></div>
+        <h3>Từ khóa đã crawl — hiệu quả</h3>
+        <div id="suggestPerf"></div>
+      </div>
+    </div>
   </section>
 
   <!-- ─────────────── KHO BÀI ─────────────── -->
@@ -55,11 +70,6 @@
     <div class="filters panel">
       <select id="fQuery"><option value="">Tất cả từ khóa</option></select>
       <input id="fSearch" placeholder="Tìm nội dung / tác giả...">
-      <select id="fUsed">
-        <option value="">Tất cả</option>
-        <option value="false">Chưa làm video</option>
-        <option value="true">Đã làm video</option>
-      </select>
       <select id="fSort">
         <option value="likes">Nhiều like nhất</option>
         <option value="replies">Nhiều bình luận</option>
@@ -75,93 +85,79 @@
   <!-- ─────────────── TẠO VIDEO ─────────────── -->
   <section id="tab-create" class="tab">
     <div id="createEmpty" class="empty panel">
-      <p>Chưa chọn bài viết.</p>
+      <p>Chưa có video nào đang làm.</p>
+      <p class="muted small">Vào Kho bài, tick chọn một hoặc nhiều bài rồi bấm "Tạo video".</p>
       <button class="primary" data-goto="library">Chọn bài trong Kho bài</button>
     </div>
-    <div id="createMain" class="create hidden">
-      <div class="create-left">
-        <div class="panel">
-          <div class="panel-head">
-            <h2>1. Bài viết</h2>
-            <button class="ghost sm" data-goto="library">Đổi bài</button>
-          </div>
-          <div id="cPost"></div>
-        </div>
 
-        <div class="panel">
-          <div class="panel-head">
-            <h2>2. Chọn bình luận</h2>
-            <div class="row gap">
-              <button id="repliesTop" class="ghost sm">Top 3 like</button>
-              <button id="repliesNone" class="ghost sm">Bỏ hết</button>
+    <div id="editor" class="editor hidden">
+      <div class="ed-bar">
+        <input id="pName" class="ed-name" placeholder="Tên video (tùy chọn)">
+        <button id="undoBtn" class="ghost sm" title="Hoàn tác (Ctrl+Z)">↶ Hoàn tác</button>
+        <span id="ttsStatus" class="muted small grow"></span>
+        <button id="newProject" class="ghost sm">Video mới</button>
+        <button id="renderBtn" class="primary">🎬 Xuất video</button>
+      </div>
+
+      <aside class="ed-posts panel">
+        <div class="panel-head">
+          <h2>Bài viết</h2>
+          <button class="ghost sm" id="addPosts">+ Thêm bài</button>
+        </div>
+        <p class="muted small">Bấm vào bình luận để thêm/bớt thẻ trên timeline.</p>
+        <div id="edPosts"></div>
+        <div class="ed-rebuild">
+          <label class="inline small">Tối đa dòng/thẻ <input id="maxLines" type="number" value="11" min="4" max="20" class="xs"></label>
+          <label class="inline small"><input type="checkbox" id="withImage" checked> Ảnh trong bài</label>
+          <button id="rebuildAll" class="ghost sm" title="Dựng lại tất cả thẻ từ bài viết (mất chỉnh sửa chữ)">↻ Dựng lại</button>
+        </div>
+      </aside>
+
+      <section class="ed-stage panel">
+        <div class="stage-wrap"><canvas id="stage" width="540" height="960"></canvas></div>
+        <div class="transport">
+          <button id="playBtn" class="primary round" title="Phát / dừng (Space)">▶</button>
+          <span id="timeLabel" class="mono">0:00.0 / 0:00.0</span>
+        </div>
+      </section>
+
+      <aside class="ed-inspector panel" id="inspector"></aside>
+
+      <section class="ed-timeline panel">
+        <div class="tl-toolbar">
+          <button id="addText" class="ghost sm">+ Chữ</button>
+          <button id="addMusic" class="ghost sm">+ Nhạc</button>
+          <span class="muted small">Kéo meme từ thư viện vào hàng Meme · kéo thẻ để đổi thứ tự · kéo mép phải để chỉnh độ dài</span>
+          <span class="grow"></span>
+          <label class="inline small">Thu phóng <input id="zoom" type="range" min="8" max="140" value="32"></label>
+          <button id="fitBtn" class="ghost sm">Vừa khung</button>
+        </div>
+        <div class="tl-main">
+          <div class="tl-labels">
+            <div class="tl-label ruler"></div>
+            <div class="tl-label">✏️ Chữ</div>
+            <div class="tl-label seg">🗨️ Thẻ + giọng</div>
+            <div class="tl-label">😹 Meme</div>
+            <div class="tl-label">🎵 Nhạc</div>
+            <div class="tl-label">🎞 Nền</div>
+          </div>
+          <div class="tl-scroll" id="tlScroll">
+            <div class="tl-content" id="tlContent">
+              <div class="tl-ruler" id="tlRuler"></div>
+              <div class="tl-row" data-row="text"></div>
+              <div class="tl-row seg" data-row="seg"></div>
+              <div class="tl-row" data-row="meme"></div>
+              <div class="tl-row" data-row="music"></div>
+              <div class="tl-row" data-row="bg"></div>
+              <div class="tl-playhead" id="tlPlayhead"></div>
             </div>
           </div>
-          <p class="muted small">Thứ tự đọc = thứ tự bạn tick. Bài "tác giả viết tiếp" được chọn sẵn.</p>
-          <div id="cReplies" class="replies"></div>
-          <div class="row gap wrap">
-            <label class="inline">Tối đa dòng / thẻ <input id="maxLines" type="number" value="11" min="4" max="20" class="xs"></label>
-            <label class="inline"><input type="checkbox" id="withImage" checked> Hiện ảnh trong bài</label>
-            <button id="buildScript" class="primary">Tạo kịch bản →</button>
-          </div>
         </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <h2>3. Kịch bản</h2>
-            <span id="scriptInfo" class="muted small"></span>
-          </div>
-          <p class="muted small">Mỗi đoạn = 1 thẻ trên video. "Lời đọc" là văn bản đưa vào giọng đọc — sửa thoải mái (viết tắt, tên riêng...).</p>
-          <div id="cSegments" class="segments"><p class="muted">Bấm "Tạo kịch bản" sau khi chọn bình luận.</p></div>
-        </div>
-      </div>
-
-      <div class="create-right">
-        <div class="panel sticky">
-          <div class="preview-box">
-            <img id="previewImg" alt="">
-            <div id="previewEmpty" class="preview-empty">Xem trước bố cục</div>
-          </div>
-          <div class="row gap">
-            <select id="previewSeg" class="grow"></select>
-            <button id="previewBtn" class="ghost">Xem trước</button>
-          </div>
-
-          <h3>Giọng đọc</h3>
-          <div class="row gap">
-            <select id="sVoice" class="grow"></select>
-            <button id="sampleBtn" class="ghost" title="Nghe thử">▶ Nghe thử</button>
-          </div>
-          <audio id="sampleAudio" class="hidden"></audio>
-          <div class="opts">
-            <label class="field"><span>Tốc độ <b id="speedVal">1.1x</b></span><input id="sSpeed" type="range" min="0.8" max="1.6" step="0.05" value="1.1"></label>
-            <label class="field"><span>Chất lượng</span>
-              <select id="sPrecision"><option value="fp32">Chuẩn</option><option value="int8">Nhanh (int8)</option></select></label>
-          </div>
-
-          <h3>Chữ & thẻ</h3>
-          <label class="field"><span>Tiêu đề trên video <em>(tùy chọn)</em></span><input id="sTitle" placeholder="vd: Con gái đi Malaysia 1 mình có an toàn?"></label>
-          <div class="seg-toggle" id="sTheme">
-            <button data-v="light" class="active">Thẻ sáng</button><button data-v="dark">Thẻ tối</button>
-          </div>
-
-          <h3>Video nền <em class="muted small">(cắt ngẫu nhiên 1 đoạn vừa đủ dài)</em></h3>
-          <div id="bgGrid" class="thumb-grid"></div>
-
-          <h3>Nhạc nền</h3>
-          <select id="sMusic"></select>
-          <div class="row gap">
-            <audio id="musicAudio" controls class="grow"></audio>
-          </div>
-          <label class="field"><span>Âm lượng nhạc <b id="musicVolVal">15%</b></span><input id="sMusicVol" type="range" min="0" max="0.6" step="0.01" value="0.15"></label>
-
-          <h3>Meme</h3>
+        <div class="meme-lib-wrap">
+          <select id="memeCat" class="sm" title="Lọc meme theo nhóm"></select>
           <div id="memeLib" class="meme-lib"></div>
-          <div id="memeList" class="meme-list"></div>
-
-          <button id="renderBtn" class="primary big">🎬 Xuất video</button>
-          <div id="renderStatus" class="render-status hidden"></div>
         </div>
-      </div>
+      </section>
     </div>
   </section>
 
@@ -170,6 +166,13 @@
     <div id="videosGrid" class="videos-grid"></div>
   </section>
 </main>
+
+<div id="pickBar" class="pick-bar hidden">
+  <span id="pickCount"></span>
+  <button id="pickClear" class="ghost sm">Bỏ chọn</button>
+  <button id="pickAdd" class="ghost hidden">➕ Thêm vào video đang làm</button>
+  <button id="pickCreate" class="primary">🎬 Tạo video mới</button>
+</div>
 
 <div id="drawer" class="drawer hidden">
   <div class="drawer-body">
@@ -180,5 +183,6 @@
 <div id="toasts"></div>
 
 <script src="app.js"></script>
+<script src="editor.js"></script>
 </body>
 </html>

@@ -17,17 +17,27 @@ EMOJI_FONT_CANDIDATES = [
     "/System/Library/Fonts/Apple Color Emoji.ttc",
 ]
 
+# Kích thước theo giao diện Threads, phóng to theo U (1 "px" Threads ở cỡ chữ 15px).
+TEXT_SIZE = 42
+U = TEXT_SIZE / 15
 CARD_W = 940
-PAD = 44
-AVATAR = 92
-TEXT_SIZE = 44
-LINE_H = int(TEXT_SIZE * 1.38)
-TEXT_W = CARD_W - 2 * PAD
-MAX_CARD_H = 1380  # chừa chỗ cho tiêu đề phía trên trong khung 1920
+PAD = round(16 * U)
+AVATAR = round(36 * U)
+GUTTER = round(12 * U)  # khoảng giữa avatar và cột tên
+LINE_H = int(TEXT_SIZE * 1.4)
+POST_TEXT_W = CARD_W - 2 * PAD  # bài viết: nội dung chạy hết bề ngang dưới avatar
+COMMENT_TEXT_W = CARD_W - 2 * PAD - AVATAR - GUTTER  # bình luận: thụt vào thẳng cột tên
+MAX_CARD_H = 1320  # = dải dành cho thẻ trong khung 1920 (xem video.CARD_TOP)
 
 THEMES = {
-    "light": {"bg": (255, 255, 255, 255), "text": (16, 16, 16), "muted": (130, 130, 130), "line": (225, 225, 225)},
-    "dark": {"bg": (24, 24, 24, 255), "text": (243, 245, 247), "muted": (150, 150, 150), "line": (60, 60, 60)},
+    "dark": {
+        "bg": (16, 16, 16, 255), "border": (51, 51, 51), "text": (243, 245, 247),
+        "muted": (119, 119, 119), "icon": (204, 204, 204),
+    },
+    "light": {
+        "bg": (255, 255, 255, 255), "border": (219, 219, 219), "text": (0, 0, 0),
+        "muted": (153, 153, 153), "icon": (66, 66, 66),
+    },
 }
 
 EMOJI_RE = re.compile(
@@ -160,7 +170,7 @@ def draw_lines(
 _SENTENCE_RE = re.compile(r"[^.!?…\n]*(?:[.!?…]+|\n+|$)\s*")
 
 
-def paginate(text: str, max_lines: int = 12) -> list[str]:
+def paginate(text: str, max_lines: int = 12, width: int = POST_TEXT_W) -> list[str]:
     """Split long text into chunks that each fit on one card, cắt theo câu khi có thể."""
     f = font(TEXT_SIZE)
     sentences = [s for s in _SENTENCE_RE.findall(text.strip()) if s]
@@ -168,13 +178,13 @@ def paginate(text: str, max_lines: int = 12) -> list[str]:
     cur = ""
     for sent in sentences:
         candidate = cur + sent
-        if len(wrap(candidate.strip(), f, TEXT_W)) <= max_lines:
+        if len(wrap(candidate.strip(), f, width)) <= max_lines:
             cur = candidate
             continue
         if cur.strip():
             pages.append(cur.strip())
         cur = sent
-        lines = wrap(cur.strip(), f, TEXT_W)
+        lines = wrap(cur.strip(), f, width)
         while len(lines) > max_lines:  # một câu quá dài -> cắt theo dòng
             pages.append(" ".join(line_text(line) for line in lines[:max_lines]).strip())
             lines = lines[max_lines:]
@@ -184,26 +194,45 @@ def paginate(text: str, max_lines: int = 12) -> list[str]:
     return pages or [""]
 
 
-# ── Thẻ bài viết ─────────────────────────────────────────────────────────────
+# ── Thẻ bài viết / bình luận kiểu Threads ─────────────────────────────────────
 
 
-def _avatar(path: str | None, username: str) -> Image.Image:
-    mask = Image.new("L", (AVATAR * 4, AVATAR * 4), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, AVATAR * 4 - 1, AVATAR * 4 - 1), fill=255)
-    mask = mask.resize((AVATAR, AVATAR), Image.LANCZOS)
+def _circle_mask(size: int) -> Image.Image:
+    mask = Image.new("L", (size * 4, size * 4), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+    return mask.resize((size, size), Image.LANCZOS)
+
+
+def _avatar(path: str | None, username: str, ring) -> Image.Image:
+    """Avatar tròn + nút "+" (theo dõi) màu trắng ở góc dưới phải, viền cùng màu nền thẻ."""
+    av = None
     if path and Path(path).exists():
         try:
             av = ImageOps.fit(Image.open(path).convert("RGBA"), (AVATAR, AVATAR), Image.LANCZOS)
-            av.putalpha(mask)
-            return av
         except OSError:
-            pass
-    hue = sum(map(ord, username)) % 360
-    av = Image.new("RGBA", (AVATAR, AVATAR), f"hsl({hue}, 55%, 50%)")
-    d = ImageDraw.Draw(av)
-    d.text((AVATAR / 2, AVATAR / 2), username[:1].upper(), font=font(44, True), fill="white", anchor="mm")
-    av.putalpha(mask)
-    return av
+            av = None
+    if av is None:
+        hue = sum(map(ord, username)) % 360
+        av = Image.new("RGBA", (AVATAR, AVATAR), f"hsl({hue}, 45%, 45%)")
+        ImageDraw.Draw(av).text((AVATAR / 2, AVATAR / 2), username[:1].upper(), font=font(int(AVATAR * 0.45), True),
+                                fill="white", anchor="mm")
+    av.putalpha(_circle_mask(AVATAR))
+
+    badge = round(AVATAR * 0.46)
+    border = max(2, round(2.2 * U))
+    out = Image.new("RGBA", (AVATAR + border, AVATAR + border), (0, 0, 0, 0))
+    out.alpha_composite(av, (0, 0))
+    s4 = (badge + 2 * border) * 4
+    b = Image.new("RGBA", (s4, s4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(b)
+    d.ellipse((0, 0, s4 - 1, s4 - 1), fill=ring)
+    d.ellipse((border * 4, border * 4, s4 - border * 4 - 1, s4 - border * 4 - 1), fill="white")
+    c, arm, w = s4 / 2, badge * 4 * 0.24, max(4, round(badge * 4 * 0.09))
+    d.line([(c - arm, c), (c + arm, c)], fill="black", width=w)
+    d.line([(c, c - arm), (c, c + arm)], fill="black", width=w)
+    b = b.resize((badge + 2 * border, badge + 2 * border), Image.LANCZOS)
+    out.alpha_composite(b, (AVATAR + border - b.width + border, AVATAR + border - b.height + border))
+    return out
 
 
 def _verified_badge(size: int) -> Image.Image:
@@ -216,12 +245,78 @@ def _verified_badge(size: int) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
+@lru_cache(maxsize=32)
+def _icon(name: str, size: int, color: tuple) -> Image.Image:
+    """Line icons giống thanh tương tác của Threads (vẽ to 4 lần rồi thu nhỏ cho mịn)."""
+    import math
+
+    S = size * 4
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    w = max(4, round(S * 0.085))
+    col = (*color, 255)
+    P = lambda x, y: (x * S, y * S)  # noqa: E731
+
+    if name == "heart":
+        pts = []
+        for i in range(120):
+            t = 2 * math.pi * i / 120
+            x = 16 * math.sin(t) ** 3
+            y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+            pts.append(P(0.5 + x / 38, 0.47 - y / 38))
+        d.line(pts + pts[:2], fill=col, width=w, joint="curve")
+    elif name == "comment":
+        box = (*P(0.1, 0.1), *P(0.9, 0.9))
+        d.arc(box, start=140, end=110 + 360, fill=col, width=w)
+        cx, cy, r = S / 2, S / 2, 0.4 * S - w / 2
+        a1, a2 = math.radians(110), math.radians(140)
+        p1 = (cx + r * math.cos(a1), cy + r * math.sin(a1))
+        p2 = (cx + r * math.cos(a2), cy + r * math.sin(a2))
+        d.line([p1, P(0.12, 0.9), p2], fill=col, width=w, joint="curve")
+    elif name == "repost":
+        d.line([P(0.2, 0.58), P(0.2, 0.36), P(0.26, 0.28), P(0.84, 0.28)], fill=col, width=w, joint="curve")
+        d.line([P(0.7, 0.14), P(0.85, 0.28), P(0.7, 0.42)], fill=col, width=w, joint="curve")
+        d.line([P(0.8, 0.42), P(0.8, 0.64), P(0.74, 0.72), P(0.16, 0.72)], fill=col, width=w, joint="curve")
+        d.line([P(0.3, 0.58), P(0.15, 0.72), P(0.3, 0.86)], fill=col, width=w, joint="curve")
+    elif name == "share":
+        tip, left, inner, bottom = P(0.88, 0.12), P(0.1, 0.4), P(0.44, 0.56), P(0.6, 0.9)
+        d.line([tip, left, inner, bottom, tip], fill=col, width=w, joint="curve")
+        d.line([tip, inner], fill=col, width=w)
+    elif name == "dots":
+        for x in (0.2, 0.5, 0.8):
+            r = S * 0.075
+            d.ellipse((x * S - r, S / 2 - r, x * S + r, S / 2 + r), fill=col)
+    return img.resize((size, size), Image.LANCZOS)
+
+
 def _fmt_count(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
     if n >= 1_000:
         return f"{n / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
     return str(n)
+
+
+def relative_time(iso: str | None) -> str:
+    """'3h', '2d', '5w' như Threads; quá 1 năm thì ghi ngày."""
+    if not iso:
+        return ""
+    from datetime import datetime, timezone
+
+    try:
+        then = datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    sec = max(0, (datetime.now(timezone.utc) - then).total_seconds())
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if sec >= size:
+            n = int(sec // size)
+            if unit == "w" and n > 52:
+                return then.strftime("%m/%d/%y")
+            return f"{n}{unit}"
+    return "now"
 
 
 def _rounded(img: Image.Image, radius: int) -> Image.Image:
@@ -236,77 +331,97 @@ def render_card(
     username: str,
     text: str,
     *,
+    style: str = "post",
     avatar_path: str | None = None,
     verified: bool = False,
-    reply_to: str | None = None,
+    published_at: str | None = None,
     likes: int | None = None,
     replies: int | None = None,
+    reposts: int | None = None,
     image_path: str | None = None,
     page_label: str | None = None,
-    theme: str = "light",
+    theme: str = "dark",
 ) -> Image.Image:
-    """Render one card. `likes`/`replies` None = ẩn dòng thống kê (dùng cho trang tiếp theo)."""
-    t = THEMES.get(theme, THEMES["light"])
-    f_text, f_name, f_small = font(TEXT_SIZE), font(38, True), font(30)
-    lines = wrap(text, f_text, TEXT_W)
+    """Render a card giống hệt Threads.
 
-    header_h = AVATAR
-    body_h = len(lines) * LINE_H if text.strip() else 0
-    stats_h = 70 if likes is not None else 0
+    style="post": nội dung chạy hết bề ngang dưới avatar (trang chi tiết bài viết).
+    style="comment": nội dung và thanh tương tác thụt vào thẳng cột tên.
+    `likes` None = ẩn thanh tương tác (trang giữa của một bài dài).
+    """
+    t = THEMES.get(theme, THEMES["dark"])
+    comment = style == "comment"
+    f_text, f_name, f_meta, f_count = font(TEXT_SIZE), font(TEXT_SIZE, True), font(TEXT_SIZE), font(round(14 * U))
+    col_x = PAD + AVATAR + GUTTER
+    text_x, text_w = (col_x, COMMENT_TEXT_W) if comment else (PAD, POST_TEXT_W)
+    lines = wrap(text, f_text, text_w) if text.strip() else []
 
-    # Ảnh co lại cho vừa phần còn trống; quá ít chỗ thì bỏ ảnh.
+    name_h = round(TEXT_SIZE * 1.35)
+    text_top = PAD + (name_h + round(2 * U) if comment else AVATAR + round(10 * U))
+    body_h = len(lines) * LINE_H
+    icon = round(19.5 * U)
+    actions_h = icon + round(14 * U) if likes is not None else 0
+    fixed = text_top + body_h + actions_h + PAD
+
     pic = None
-    room = MAX_CARD_H - (PAD + header_h + 26 + body_h + stats_h + PAD + 18)
+    room = MAX_CARD_H - fixed - round(12 * U)
     if image_path and Path(image_path).exists() and room >= 260:
         try:
             pic = Image.open(image_path).convert("RGB")
-            pic.thumbnail((TEXT_W, min(room, 680)), Image.LANCZOS)
-            pic = _rounded(pic, 24)
+            pic.thumbnail((text_w, min(room, 700)), Image.LANCZOS)
+            pic = _rounded(pic, round(8 * U))
         except OSError:
             pic = None
-    pic_h = pic.height + 28 if pic else 0
-    h = PAD + header_h + 26 + body_h + pic_h + stats_h + PAD - 10
+    pic_h = pic.height + round(10 * U) if pic else 0
+    h = max(fixed + pic_h, PAD + AVATAR + PAD)
 
     shadow_pad = 30
+    radius = round(14 * U)
     out = Image.new("RGBA", (CARD_W + 2 * shadow_pad, h + 2 * shadow_pad), (0, 0, 0, 0))
     shadow = Image.new("RGBA", out.size, (0, 0, 0, 0))
     ImageDraw.Draw(shadow).rounded_rectangle(
-        (shadow_pad, shadow_pad + 8, shadow_pad + CARD_W, shadow_pad + h + 8), 40, fill=(0, 0, 0, 110)
+        (shadow_pad, shadow_pad + 8, shadow_pad + CARD_W, shadow_pad + h + 8), radius, fill=(0, 0, 0, 120)
     )
     out.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(16)))
 
     card = Image.new("RGBA", (CARD_W, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(card)
-    d.rounded_rectangle((0, 0, CARD_W - 1, h - 1), 40, fill=t["bg"])
+    d.rounded_rectangle((0, 0, CARD_W - 1, h - 1), radius, fill=t["bg"], outline=t["border"], width=max(2, round(U)))
 
-    # Header: avatar + tên + tích xanh + dòng phụ
-    card.alpha_composite(_avatar(avatar_path, username), (PAD, PAD))
-    nx = PAD + AVATAR + 24
-    d.text((nx, PAD + 4), username, font=f_name, fill=t["text"])
-    name_w = f_name.getlength(username)
+    # Header: avatar(+) · tên · tích xanh · thời gian ············· ···
+    card.alpha_composite(_avatar(avatar_path, username, t["bg"][:3]), (PAD, PAD))
+    name_y = PAD if comment else PAD + (AVATAR - name_h) // 2
+    d.text((col_x, name_y), username, font=f_name, fill=t["text"])
+    x = col_x + f_name.getlength(username) + round(6 * U)
     if verified:
-        card.alpha_composite(_verified_badge(34), (int(nx + name_w + 12), PAD + 14))
-    sub = f"Trả lời @{reply_to}" if reply_to else "Threads"
+        vb = round(14 * U)
+        card.alpha_composite(_verified_badge(vb), (int(x), int(name_y + (name_h - vb) / 2 + U)))
+        x += vb + round(6 * U)
+    meta = relative_time(published_at)
     if page_label:
-        sub += f"  ·  {page_label}"
-    d.text((nx, PAD + 52), sub, font=f_small, fill=t["muted"])
+        meta = f"{meta} · {page_label}" if meta else page_label
+    if meta:
+        d.text((x, name_y), meta, font=f_meta, fill=t["muted"])
+    dots = _icon("dots", round(20 * U), t["muted"])
+    card.alpha_composite(dots, (CARD_W - PAD - dots.width + round(4 * U), int(name_y + (name_h - dots.height) / 2)))
 
-    y = PAD + header_h + 26
-    if text.strip():
-        y = draw_lines(card, lines, PAD, y, f_text, t["text"], LINE_H)
+    y = text_top
+    if lines:
+        y = draw_lines(card, lines, text_x, y, f_text, t["text"], LINE_H)
     if pic:
-        y += 14
-        card.alpha_composite(pic, (PAD + (TEXT_W - pic.width) // 2, y))
-        y += pic.height + 14
+        y += round(6 * U)
+        card.alpha_composite(pic, (text_x, y))
+        y += pic.height + round(4 * U)
     if likes is not None:
-        y += 14
-        x = PAD
-        for icon, n in (("❤️", likes), ("💬", replies or 0)):
-            em = _emoji_image(icon, 36)
-            if em:
-                card.alpha_composite(em, (x, y + 2))
-            d.text((x + 48, y - 2), _fmt_count(n), font=f_small, fill=t["muted"])
-            x += 48 + int(f_small.getlength(_fmt_count(n))) + 44
+        y += round(12 * U)
+        x = text_x - round(2 * U)
+        for name, n in (("heart", likes), ("comment", replies), ("repost", reposts), ("share", None)):
+            card.alpha_composite(_icon(name, icon, t["icon"]), (int(x), int(y)))
+            x += icon + round(5 * U)
+            if n:
+                label = _fmt_count(n)
+                d.text((x, y + (icon - f_count.size * 1.36) / 2), label, font=f_count, fill=t["icon"])
+                x += f_count.getlength(label)
+            x += round(16 * U)
 
     out.alpha_composite(card, (shadow_pad, shadow_pad))
     return out
