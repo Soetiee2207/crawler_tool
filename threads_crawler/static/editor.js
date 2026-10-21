@@ -924,6 +924,11 @@ const Editor = (() => {
     if (!sel) {
       html = head("Cài đặt video", false) + `
         <p class="hint">Bấm vào một mục trên timeline để chỉnh nó.</p>
+        <label class="field"><span>📅 Ngày giờ đăng TikTok</span>
+          <input type="datetime-local" data-f="publish_at" value="${esc(P.publish_at || "")}"></label>
+        <div class="row gap wrap">${[["today19", "Tối nay 19:00"], ["tomorrow12", "Mai 12:00"], ["tomorrow19", "Mai 19:00"], ["clear", "Chưa hẹn"]]
+          .map(([k, l]) => `<button class="ghost sm" data-when="${k}">${l}</button>`).join("")}</div>
+        <p class="hint">Video sẽ được lưu vào <code>data/videos/${esc(P.publish_at ? P.publish_at.slice(0, 10) : "chưa_hẹn_giờ")}/</code>${P.publish_at ? `, tên file bắt đầu bằng <code>${esc(P.publish_at.slice(11, 13))}h${esc(P.publish_at.slice(14, 16))}</code>` : ""}.</p>
         <label class="field"><span>Giọng đọc</span>
           <select data-f="voice">${state.voices.map((v) => `<option value="${esc(v.id)}" ${v.id === P.voice ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>
         <button class="ghost sm" data-cmd="sample">▶ Nghe thử giọng này</button>
@@ -1008,7 +1013,8 @@ const Editor = (() => {
     const live = e.target.tagName === "TEXTAREA" || e.target.type === "number" || e.target.type === "range" || e.target.tagName === "INPUT";
     const apply = () => {
       if (!sel) {
-        if (f === "voice" || f === "precision") P[f] = raw;
+        if (f === "publish_at") P.publish_at = raw || null;
+        else if (f === "voice" || f === "precision") P[f] = raw;
         else P[f] = num ?? P[f];
         saveDefaults();
       } else if (sel.type === "seg") {
@@ -1054,6 +1060,8 @@ const Editor = (() => {
       return play();
     }
     if (cmd === "rerollBg") return mutate(() => pickBackground(true));
+    const when = t_.closest("[data-when]")?.dataset.when;
+    if (when) return mutate(() => (P.publish_at = whenPreset(when)));
     const pos = t_.closest("[data-pos]")?.dataset.pos;
     if (pos && it) return mutate(() => (it.position = pos));
     const tpos = t_.closest("[data-tpos]")?.dataset.tpos;
@@ -1062,6 +1070,15 @@ const Editor = (() => {
     if (theme) return mutate(() => { P.theme = theme; saveDefaults(); });
     const bg = t_.closest("[data-bg]")?.dataset.bg;
     if (bg) return mutate(() => { P.background = { path: bg, start: 0 }; pickBackground(true); });
+  }
+
+  // Giờ đăng dạng "YYYY-MM-DDTHH:MM" theo giờ máy (đúng định dạng của input datetime-local).
+  function whenPreset(key) {
+    if (key === "clear") return null;
+    const d = new Date();
+    if (key.startsWith("tomorrow")) d.setDate(d.getDate() + 1);
+    d.setHours(+key.replace(/\D/g, ""), 0, 0, 0);
+    return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
   }
 
   async function playSample(btn) {
@@ -1112,14 +1129,15 @@ const Editor = (() => {
 
   function renderMemeLib() {
     const all = state.materials.memes;
-    const cats = [...new Set(all.map((m) => m.category))];
+    const cats = [...new Set(all.map((m) => m.category))].sort((a, b) => a.localeCompare(b, "vi"));
+    const label = (c) => (c || "chung").replaceAll("_", " ");
     const cur = store.get("memeCat", "");
     $("#memeCat").innerHTML = `<option value="">😹 Tất cả meme (${all.length})</option>` +
-      cats.map((c) => `<option value="${esc(c)}" ${c === cur ? "selected" : ""}>${esc(c || "chung")} (${all.filter((m) => m.category === c).length})</option>`).join("");
+      cats.map((c) => `<option value="${esc(c)}" ${c === cur ? "selected" : ""}>${esc(label(c))} (${all.filter((m) => m.category === c).length})</option>`).join("");
     const memes = all.filter((m) => !cur || m.category === cur);
     $("#memeLib").innerHTML = memes.length ? memes.map((m) => `
       <div class="meme-item checker" draggable="true" data-meme="${esc(m.path)}" title="${esc(m.name)} (${m.duration.toFixed(1)}s) — kéo vào timeline hoặc bấm để thêm ở vị trí đầu phát">
-        <img src="${thumbUrl("memes", m.path)}" loading="lazy" alt=""><span class="cat">${esc(m.category || "")}</span></div>`).join("")
+        <img src="${thumbUrl("memes", m.path)}" loading="lazy" alt=""><span class="cat">${esc(label(m.category))}</span></div>`).join("")
       : '<span class="muted small">Chưa có meme trong materials/meme_video</span>';
   }
 

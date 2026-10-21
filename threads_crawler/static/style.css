@@ -141,6 +141,14 @@ main { padding: 20px; max-width: 1760px; margin: 0 auto; }
 .video-card .actions { display: flex; gap: 6px; padding: 0 12px 12px; }
 .video-card .actions a { flex: 1; }
 .video-card .actions a button { width: 100%; }
+.video-card .actions button { padding-left: 8px; padding-right: 8px; }
+.video-card .when { font-weight: 600; color: var(--accent-2); }
+.video-card .when.past { color: var(--warn); }
+.video-card .path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.video-card .field input { width: 100%; }
+.video-day { margin-bottom: 28px; }
+.video-day h3 { margin: 0 0 12px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.video-day h3 .muted, .video-day h3 code { text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 .empty { text-align: center; padding: 50px; }
 

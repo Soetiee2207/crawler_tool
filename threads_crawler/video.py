@@ -21,7 +21,7 @@ from typing import Callable, Literal
 import numpy as np
 import soundfile as sf
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import PROJECT_ROOT, cards, media, tts
 from .storage import Store
@@ -119,6 +119,14 @@ class Project(BaseModel):
     speed: float = Field(1.1, ge=0.7, le=1.8)
     gap: float = Field(0.35, ge=0, le=5)
     theme: Literal["light", "dark"] = "dark"
+    publish_at: str | None = None  # giờ dự định đăng, "YYYY-MM-DDTHH:MM" -> quyết định thư mục chứa video
+
+    @field_validator("publish_at")
+    @classmethod
+    def _check_publish_at(cls, v: str | None) -> str | None:
+        if not v:
+            return None
+        return datetime.fromisoformat(v).strftime("%Y-%m-%dT%H:%M")
 
 
 # ── Kịch bản ─────────────────────────────────────────────────────────────────
@@ -374,9 +382,8 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         + f"amix=inputs={len(labels)}:duration=longest:normalize=0,alimiter=limit=0.95[aout]"
     )
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     first_code = p.post_codes[0] if p.post_codes else (p.segments[0].post_code or "video")
-    out = store.videos_dir / f"{stamp}_{first_code}.mp4"
+    out = work / "out.mp4"  # dựng xong mới chuyển vào thư mục lịch đăng, tránh file dở dang ở đó
     cmd = ["ffmpeg", "-y", "-v", "error", "-nostats", "-progress", "pipe:1"]
     for args in inputs:
         cmd += args
@@ -400,7 +407,8 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         "memes": len(p.memes),
     }
     title = p.name.strip() or next((x.text for x in p.texts if x.text.strip()), "") or p.segments[0].display_text[:80]
-    video_id = store.add_video(first_code, title, out, thumb, round(total, 2), config)
+    out, thumb = store.place_video(out, thumb, store.video_dest(p.publish_at, title, first_code))
+    video_id = store.add_video(first_code, title, out, thumb, round(total, 2), config, p.publish_at)
     store.archive_used(p.post_codes or [first_code], video_id)
     on_progress(1.0, "Xong")
     return {"id": video_id, "path": str(out), "duration": total}

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,6 +48,7 @@ CREATE TABLE IF NOT EXISTS videos (
     thumb_path TEXT,
     duration REAL,
     config_json TEXT,
+    publish_at TEXT,           -- giờ dự định đăng TikTok (YYYY-MM-DDTHH:MM, giờ máy)
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -62,9 +65,12 @@ CREATE TABLE IF NOT EXISTS done_posts (
 
 # Cột thêm sau phiên bản đầu; DB cũ được bổ sung khi mở.
 MIGRATIONS = {
-    "reply_to_username": "TEXT",
-    "avatar_path": "TEXT",
+    "posts": {"reply_to_username": "TEXT", "avatar_path": "TEXT"},
+    "videos": {"publish_at": "TEXT"},
 }
+
+# Video chưa hẹn giờ đăng nằm ở data/videos/<UNSCHEDULED>/, có hẹn giờ thì ở data/videos/<YYYY-MM-DD>/.
+UNSCHEDULED = "chưa_hẹn_giờ"
 
 
 def _row_to_post(row: sqlite3.Row) -> dict:
@@ -85,16 +91,21 @@ class Store:
         self.videos_dir.mkdir(parents=True, exist_ok=True)
         self._path = data_dir / "threads.db"
         self._local = threading.local()
-        cols = {r[1] for r in self.db.execute("PRAGMA table_info(posts)")}
-        if cols:
-            for col, typ in MIGRATIONS.items():
-                if col not in cols:
-                    self.db.execute(f"ALTER TABLE posts ADD COLUMN {col} {typ}")
+        for table, columns in MIGRATIONS.items():
+            cols = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if cols:
+                for col, typ in columns.items():
+                    if col not in cols:
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.db.executescript(SCHEMA)
         # Bài đánh dấu "đã dùng" từ phiên bản cũ → chuyển sang cơ chế xóa khỏi kho.
         used = [r[0] for r in self.db.execute("SELECT code FROM posts WHERE used = 1 AND parent_code IS NULL")]
         if used:
             self.archive_used(used)
+        # Video xuất từ phiên bản cũ nằm thẳng trong data/videos/ → gom vào thư mục chưa hẹn giờ.
+        for row in self.db.execute("SELECT id, path FROM videos WHERE publish_at IS NULL").fetchall():
+            if Path(row["path"]).parent == self.videos_dir:
+                self.reschedule_video(row["id"], None)
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -257,19 +268,73 @@ class Store:
 
     # ── Video đã xuất ─────────────────────────────────────────────────────────
 
-    def add_video(self, post_code: str, title: str, path: Path, thumb: Path, duration: float, config: dict) -> int:
+    def video_dest(self, publish_at: str | None, title: str, code: str, current: Path | None = None) -> Path:
+        """Đường dẫn file video theo lịch đăng: videos/2026-10-25/19h30 - <tiêu đề>.mp4.
+
+        `current` là file hiện tại của chính video này (khi đổi giờ), không tính là trùng tên.
+        """
+        if publish_at:
+            when = datetime.fromisoformat(publish_at)
+            folder, prefix = when.strftime("%Y-%m-%d"), when.strftime("%Hh%M")
+        else:
+            folder, prefix = UNSCHEDULED, datetime.now().strftime("%Y%m%d_%H%M")
+        name = re.sub(r'[\\/:*?"<>|\s]+', " ", title).strip()
+        if len(name) > 60:  # cắt ở ranh giới từ cho tên file dễ đọc
+            name = name[:60].rsplit(" ", 1)[0]
+        name = name or code
+        dest = self.videos_dir / folder / f"{prefix} - {name}.mp4"
+        n = 2
+        while dest.exists() and dest != current:
+            dest = dest.with_name(f"{prefix} - {name} ({n}).mp4")
+            n += 1
+        return dest
+
+    def place_video(self, src: Path, thumb: Path | None, dest: Path) -> tuple[Path, Path | None]:
+        """Chuyển file video (kèm ảnh bìa cùng tên .jpg) tới dest; xóa thư mục cũ nếu rỗng."""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(src, dest)
+        new_thumb = None
+        if thumb and thumb.exists():
+            new_thumb = dest.with_suffix(".jpg")
+            shutil.move(thumb, new_thumb)
+        if src.parent != dest.parent and src.parent.parent == self.videos_dir and not any(src.parent.iterdir()):
+            src.parent.rmdir()
+        return dest, new_thumb
+
+    def add_video(
+        self, post_code: str, title: str, path: Path, thumb: Path, duration: float, config: dict,
+        publish_at: str | None = None,
+    ) -> int:
         cur = self.db.execute(
-            "INSERT INTO videos (post_code, title, path, thumb_path, duration, config_json) VALUES (?, ?, ?, ?, ?, ?)",
-            (post_code, title, str(path), str(thumb), duration, json.dumps(config, ensure_ascii=False)),
+            """INSERT INTO videos (post_code, title, path, thumb_path, duration, config_json, publish_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (post_code, title, str(path), str(thumb), duration, json.dumps(config, ensure_ascii=False), publish_at),
         )
         self.db.commit()
         return cur.lastrowid
+
+    def reschedule_video(self, video_id: int, publish_at: str | None) -> None:
+        """Đổi giờ đăng và chuyển file sang thư mục của ngày mới."""
+        row = self.db.execute("SELECT * FROM videos WHERE id = ?", (video_id,)).fetchone()
+        if not row:
+            raise KeyError(video_id)
+        path = Path(row["path"])
+        thumb = Path(row["thumb_path"]) if row["thumb_path"] else None
+        dest = self.video_dest(publish_at, row["title"], row["post_code"], current=path)
+        if path.exists() and dest != path:
+            path, thumb = self.place_video(path, thumb, dest)
+        self.db.execute(
+            "UPDATE videos SET publish_at = ?, path = ?, thumb_path = ? WHERE id = ?",
+            (publish_at, str(path), str(thumb) if thumb else None, video_id),
+        )
+        self.db.commit()
 
     def list_videos(self) -> list[dict]:
         rows = self.db.execute(
             """SELECT v.*, COALESCE(p.username, d.username) AS username, COALESCE(p.query, d.query) AS query
                FROM videos v LEFT JOIN posts p ON p.code = v.post_code
-               LEFT JOIN done_posts d ON d.code = v.post_code ORDER BY v.id DESC"""
+               LEFT JOIN done_posts d ON d.code = v.post_code
+               ORDER BY v.publish_at IS NULL, v.publish_at, v.id DESC"""
         )
         result = []
         for r in rows:
@@ -284,5 +349,8 @@ class Store:
             for p in (row["path"], row["thumb_path"]):
                 if p:
                     Path(p).unlink(missing_ok=True)
+            folder = Path(row["path"]).parent
+            if folder.parent == self.videos_dir and folder.exists() and not any(folder.iterdir()):
+                folder.rmdir()
         self.db.execute("DELETE FROM videos WHERE id = ?", (video_id,))
         self.db.commit()

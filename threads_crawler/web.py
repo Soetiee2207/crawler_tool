@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import cards, keywords, media, tts, video
 from .crawler import DEFAULT_PROFILE_DIR
@@ -36,6 +38,15 @@ class CrawlRequest(BaseModel):
 class ScriptItem(BaseModel):
     code: str
     reply_codes: list[str] = []
+
+
+class ScheduleRequest(BaseModel):
+    publish_at: str | None = None
+
+    @field_validator("publish_at")
+    @classmethod
+    def _check(cls, v: str | None) -> str | None:
+        return datetime.fromisoformat(v).strftime("%Y-%m-%dT%H:%M") if v else None
 
 
 class ScriptRequest(BaseModel):
@@ -204,9 +215,31 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     def videos():
         items = store.list_videos()
         for v in items:
-            v["url"] = f"/files/videos/{Path(v['path']).name}"
-            v["thumb_url"] = f"/files/videos/{Path(v['thumb_path']).name}" if v["thumb_path"] else None
+            v["url"] = media_url(v["path"], data_dir)
+            v["thumb_url"] = media_url(v["thumb_path"], data_dir)
+            v["folder"] = str(Path(v["path"]).parent)
         return items
+
+    @app.patch("/api/videos/{video_id}")
+    def reschedule_video(video_id: int, req: ScheduleRequest):
+        try:
+            store.reschedule_video(video_id, req.publish_at)
+        except KeyError:
+            raise HTTPException(404, "Không tìm thấy video")
+        return {"ok": True}
+
+    @app.post("/api/videos/{video_id}/open")
+    def open_video_folder(video_id: int):
+        """Mở thư mục chứa video trong trình quản lý file của máy (tool chạy local)."""
+        v = next((x for x in store.list_videos() if x["id"] == video_id), None)
+        if not v:
+            raise HTTPException(404, "Không tìm thấy video")
+        try:
+            subprocess.Popen(["xdg-open", str(Path(v["path"]).parent)], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise HTTPException(500, f"Không mở được thư mục: {e}")
+        return {"ok": True}
 
     @app.delete("/api/videos/{video_id}")
     def delete_video(video_id: int):

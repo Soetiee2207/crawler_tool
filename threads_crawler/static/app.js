@@ -371,22 +371,58 @@ function replyHtml(r, post, order = 0) {
 
 // ───────────────────────── Video đã xuất ─────────────────────────
 
-async function loadVideos() {
-  const vids = await api("/api/videos");
-  $("#videosGrid").innerHTML = vids.length ? vids.map((v) => `
-    <div class="video-card" data-vid="${v.id}">
+const WEEKDAYS = ["Chủ nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"];
+
+function dayLabel(day) {
+  const d = new Date(day + "T00:00");
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const diff = Math.round((d - today) / 86400000);
+  const rel = { 0: " · Hôm nay", 1: " · Ngày mai", "-1": " · Hôm qua" }[diff] ?? (diff < 0 ? " · đã qua" : "");
+  return `📅 ${WEEKDAYS[d.getDay()]}, ${d.toLocaleDateString("vi-VN")}${rel}`;
+}
+
+function videoCardHtml(v) {
+  const past = v.publish_at && new Date(v.publish_at) < new Date();
+  return `<div class="video-card" data-vid="${v.id}">
       <img class="poster" src="${esc(v.thumb_url || "")}" data-src="${esc(v.url)}" alt="" title="Bấm để phát">
       <div class="meta">
+        ${v.publish_at ? `<span class="when ${past ? "past" : ""}">🕖 ${esc(v.publish_at.slice(11))}${past ? " · đã tới giờ" : ""}</span>` : ""}
         <b>${esc(v.title)}</b>
         <span class="muted small">⏱ ${fmtDur(v.duration)} · 🎙 ${esc(v.config.voice)} · @${esc(v.username || "")}${(v.config.post_codes || []).length > 1 ? ` +${v.config.post_codes.length - 1} bài` : ""}</span>
-        <span class="muted small">${new Date(v.created_at.replace(" ", "T") + "Z").toLocaleString("vi-VN")}</span>
         <span class="muted small" title="${esc(v.config.background_file)} @ ${v.config.background_start}s">🎞 ${esc((v.config.background_file || "").split("/").pop().slice(0, 28))} · 🎵 ${esc((v.config.music_file || "không nhạc").split("/").pop().slice(0, 24))}</span>
+        <label class="field small"><span class="muted">Giờ đăng</span>
+          <input type="datetime-local" data-vwhen value="${esc(v.publish_at || "")}"></label>
+        <span class="muted small path" title="${esc(v.path)}">📁 ${esc(v.path.split("/").slice(-2).join("/"))}</span>
       </div>
       <div class="actions">
-        <a href="${esc(v.url)}" download><button>⬇ Tải về</button></a>
+        <a href="${esc(v.url)}" download><button title="Tải về">⬇</button></a>
+        <button data-vopen title="Mở thư mục chứa video">📂 Thư mục</button>
+        <button data-vcopy title="Copy đường dẫn file">📋</button>
         <button class="danger" data-vdel title="Xóa">🗑</button>
       </div>
-    </div>`).join("") : '<div class="empty panel muted">Chưa có video nào được xuất.</div>';
+    </div>`;
+}
+
+let videosCache = [];
+async function loadVideos() {
+  const vids = (videosCache = await api("/api/videos"));
+  if (!vids.length) {
+    $("#videosGrid").innerHTML = '<div class="empty panel muted">Chưa có video nào được xuất.</div>';
+    return;
+  }
+  const groups = new Map();
+  for (const v of vids) {
+    const key = v.publish_at ? v.publish_at.slice(0, 10) : "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(v);
+  }
+  $("#videosGrid").innerHTML = [...groups].map(([day, list]) => `
+    <section class="video-day">
+      <h3>${day ? dayLabel(day) : "🗂 Chưa hẹn giờ đăng"} <span class="muted small">${list.length} video</span>
+        <code class="small" title="${esc(list[0].folder)}">📁 data/videos/${esc(list[0].folder.split("/").pop())}/</code></h3>
+      <div class="videos-grid">${list.map(videoCardHtml).join("")}</div>
+    </section>`).join("");
 }
 $("#videosGrid").onclick = async (e) => {
   const poster = e.target.closest(".poster");
@@ -397,11 +433,32 @@ $("#videosGrid").onclick = async (e) => {
     v.autoplay = true;
     poster.replaceWith(v);
   }
+  const id = e.target.closest("[data-vid]")?.dataset.vid;
+  if (!id) return;
+  const vid = videosCache.find((v) => String(v.id) === id);
+  if (e.target.closest("[data-vopen]")) {
+    try { await api(`/api/videos/${id}/open`, { method: "POST" }); } catch (err) { toast(err.message, true); }
+  }
+  if (e.target.closest("[data-vcopy]")) {
+    try {
+      await navigator.clipboard.writeText(vid.path);
+      toast("Đã copy đường dẫn video");
+    } catch { prompt("Đường dẫn video:", vid.path); }
+  }
   if (e.target.closest("[data-vdel]") && confirm("Xóa video này (cả file)?")) {
-    await api(`/api/videos/${e.target.closest("[data-vid]").dataset.vid}`, { method: "DELETE" });
+    await api(`/api/videos/${id}`, { method: "DELETE" });
     loadVideos();
   }
 };
+$("#videosGrid").addEventListener("change", async (e) => {
+  if (!e.target.matches("[data-vwhen]")) return;
+  const id = e.target.closest("[data-vid]").dataset.vid;
+  try {
+    await api(`/api/videos/${id}`, { method: "PATCH", body: { publish_at: e.target.value || null } });
+    toast(e.target.value ? "Đã đổi giờ đăng, video đã chuyển sang thư mục của ngày đó" : "Đã bỏ hẹn giờ");
+  } catch (err) { toast(err.message, true); }
+  loadVideos();
+});
 
 // ───────────────────────── Khởi động ─────────────────────────
 
