@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Threads → TikTok</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🧵 Threads <span>→</span> 🎬 TikTok</div>
+  <nav class="tabs">
+    <button data-tab="crawl" class="active">Crawl</button>
+    <button data-tab="library">Kho bài</button>
+    <button data-tab="create">Tạo video</button>
+    <button data-tab="videos">Video đã xuất</button>
+  </nav>
+  <div class="jobs-wrap">
+    <button id="jobsBtn" class="jobs-btn">Tác vụ <span id="jobsBadge" class="badge hidden">0</span></button>
+    <div id="jobsPanel" class="jobs-panel hidden"></div>
+  </div>
+</header>
+
+<main>
+  <!-- ─────────────── CRAWL ─────────────── -->
+  <section id="tab-crawl" class="tab active">
+    <div class="panel crawl-panel">
+      <h2>Từ khóa</h2>
+      <label class="field">
+        <span>Mỗi dòng một từ khóa, dùng <code>#</code> cho hashtag</span>
+        <textarea id="customKeywords" rows="6" placeholder="chuyện công sở&#10;#tamsu&#10;người yêu cũ"></textarea>
+      </label>
+      <div id="recentQueries" class="chips small"></div>
+
+      <h3>Tùy chọn</h3>
+      <div class="opts">
+        <label class="field"><span>Số bài / từ khóa</span><input id="optLimit" type="number" value="20" min="1" max="200"></label>
+        <label class="field"><span>Bình luận / bài</span><input id="optReplies" type="number" value="15" min="0" max="100"></label>
+        <label class="field"><span>Ít nhất N likes</span><input id="optMinLikes" type="number" value="0" min="0"></label>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="optRecent"> Mới nhất (thay vì nổi bật)</label>
+        <label><input type="checkbox" id="optMedia" checked> Tải ảnh/video</label>
+        <label><input type="checkbox" id="optShow"> Hiện trình duyệt</label>
+      </div>
+      <div class="crawl-summary">
+        <span id="crawlSummary">Chưa nhập từ khóa nào</span>
+        <button id="startCrawl" class="primary">Bắt đầu crawl</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────── KHO BÀI ─────────────── -->
+  <section id="tab-library" class="tab">
+    <div class="filters panel">
+      <select id="fQuery"><option value="">Tất cả từ khóa</option></select>
+      <input id="fSearch" placeholder="Tìm nội dung / tác giả...">
+      <select id="fUsed">
+        <option value="">Tất cả</option>
+        <option value="false">Chưa làm video</option>
+        <option value="true">Đã làm video</option>
+      </select>
+      <select id="fSort">
+        <option value="likes">Nhiều like nhất</option>
+        <option value="replies">Nhiều bình luận</option>
+        <option value="newest">Mới đăng</option>
+        <option value="crawled">Mới crawl</option>
+      </select>
+      <span id="postsCount" class="muted"></span>
+    </div>
+    <div id="postsGrid" class="posts-grid"></div>
+    <div class="center"><button id="loadMore" class="ghost hidden">Tải thêm</button></div>
+  </section>
+
+  <!-- ─────────────── TẠO VIDEO ─────────────── -->
+  <section id="tab-create" class="tab">
+    <div id="createEmpty" class="empty panel">
+      <p>Chưa chọn bài viết.</p>
+      <button class="primary" data-goto="library">Chọn bài trong Kho bài</button>
+    </div>
+    <div id="createMain" class="create hidden">
+      <div class="create-left">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>1. Bài viết</h2>
+            <button class="ghost sm" data-goto="library">Đổi bài</button>
+          </div>
+          <div id="cPost"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>2. Chọn bình luận</h2>
+            <div class="row gap">
+              <button id="repliesTop" class="ghost sm">Top 3 like</button>
+              <button id="repliesNone" class="ghost sm">Bỏ hết</button>
+            </div>
+          </div>
+          <p class="muted small">Thứ tự đọc = thứ tự bạn tick. Bài "tác giả viết tiếp" được chọn sẵn.</p>
+          <div id="cReplies" class="replies"></div>
+          <div class="row gap wrap">
+            <label class="inline">Tối đa dòng / thẻ <input id="maxLines" type="number" value="11" min="4" max="20" class="xs"></label>
+            <label class="inline"><input type="checkbox" id="withImage" checked> Hiện ảnh trong bài</label>
+            <button id="buildScript" class="primary">Tạo kịch bản →</button>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>3. Kịch bản</h2>
+            <span id="scriptInfo" class="muted small"></span>
+          </div>
+          <p class="muted small">Mỗi đoạn = 1 thẻ trên video. "Lời đọc" là văn bản đưa vào giọng đọc — sửa thoải mái (viết tắt, tên riêng...).</p>
+          <div id="cSegments" class="segments"><p class="muted">Bấm "Tạo kịch bản" sau khi chọn bình luận.</p></div>
+        </div>
+      </div>
+
+      <div class="create-right">
+        <div class="panel sticky">
+          <div class="preview-box">
+            <img id="previewImg" alt="">
+            <div id="previewEmpty" class="preview-empty">Xem trước bố cục</div>
+          </div>
+          <div class="row gap">
+            <select id="previewSeg" class="grow"></select>
+            <button id="previewBtn" class="ghost">Xem trước</button>
+          </div>
+
+          <h3>Giọng đọc</h3>
+          <div class="row gap">
+            <select id="sVoice" class="grow"></select>
+            <button id="sampleBtn" class="ghost" title="Nghe thử">▶ Nghe thử</button>
+          </div>
+          <audio id="sampleAudio" class="hidden"></audio>
+          <div class="opts">
+            <label class="field"><span>Tốc độ <b id="speedVal">1.1x</b></span><input id="sSpeed" type="range" min="0.8" max="1.6" step="0.05" value="1.1"></label>
+            <label class="field"><span>Chất lượng</span>
+              <select id="sPrecision"><option value="fp32">Chuẩn</option><option value="int8">Nhanh (int8)</option></select></label>
+          </div>
+
+          <h3>Chữ & thẻ</h3>
+          <label class="field"><span>Tiêu đề trên video <em>(tùy chọn)</em></span><input id="sTitle" placeholder="vd: Con gái đi Malaysia 1 mình có an toàn?"></label>
+          <div class="seg-toggle" id="sTheme">
+            <button data-v="light" class="active">Thẻ sáng</button><button data-v="dark">Thẻ tối</button>
+          </div>
+
+          <h3>Video nền <em class="muted small">(cắt ngẫu nhiên 1 đoạn vừa đủ dài)</em></h3>
+          <div id="bgGrid" class="thumb-grid"></div>
+
+          <h3>Nhạc nền</h3>
+          <select id="sMusic"></select>
+          <div class="row gap">
+            <audio id="musicAudio" controls class="grow"></audio>
+          </div>
+          <label class="field"><span>Âm lượng nhạc <b id="musicVolVal">15%</b></span><input id="sMusicVol" type="range" min="0" max="0.6" step="0.01" value="0.15"></label>
+
+          <h3>Meme</h3>
+          <div id="memeLib" class="meme-lib"></div>
+          <div id="memeList" class="meme-list"></div>
+
+          <button id="renderBtn" class="primary big">🎬 Xuất video</button>
+          <div id="renderStatus" class="render-status hidden"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────── VIDEO ĐÃ XUẤT ─────────────── -->
+  <section id="tab-videos" class="tab">
+    <div id="videosGrid" class="videos-grid"></div>
+  </section>
+</main>
+
+<div id="drawer" class="drawer hidden">
+  <div class="drawer-body">
+    <button class="drawer-close" id="drawerClose">✕</button>
+    <div id="drawerContent"></div>
+  </div>
+</div>
+<div id="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
