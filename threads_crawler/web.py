@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -18,15 +19,23 @@ from pydantic import BaseModel, Field, field_validator
 from . import cards, keywords, media, tts, video
 from .crawler import DEFAULT_PROFILE_DIR
 from .jobs import JobManager
-from .pipeline import CrawlOptions, CrawlTarget, crawl
+from .pipeline import CrawlOptions, CrawlTarget, crawl, parse_post_url, parse_username
 from .storage import Store
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
+PACKAGE_DIR = Path(__file__).parent
+
+
+def code_stamp() -> float:
+    """Lần sửa code Python gần nhất. Khác lúc server khởi động = server đang chạy code cũ."""
+    return max(f.stat().st_mtime for f in PACKAGE_DIR.glob("*.py"))
 
 
 class CrawlRequest(BaseModel):
     keywords: list[str] = []
+    urls: list[str] = []  # link bài cụ thể
+    users: list[str] = []  # tên tài khoản: crawl các bài của người đó
     limit: int = Field(20, ge=1, le=200)
     replies: int = Field(10, ge=0, le=100)
     min_likes: int = Field(0, ge=0)
@@ -62,6 +71,10 @@ class TtsRequest(BaseModel):
     normalize: bool = False  # True = làm sạch text trước (dùng cho câu nghe thử)
 
 
+class StarRequest(BaseModel):
+    starred: bool
+
+
 class CardRequest(BaseModel):
     segment: video.Segment
     theme: Literal["light", "dark"] = "dark"
@@ -72,6 +85,7 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     jobs = JobManager()
     data_dir = data_dir.resolve()
     store = Store(data_dir)  # mỗi luồng tự mở kết nối sqlite riêng
+    started_stamp = code_stamp()
 
     def with_urls(p: dict) -> dict:
         p["avatar_src"] = media_url(p.get("avatar_path"), data_dir)
@@ -84,8 +98,21 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     @app.post("/api/crawl")
     def start_crawl(req: CrawlRequest):
         targets = [CrawlTarget(k.strip()) for k in req.keywords if k.strip()]
+        bad = []
+        for u in filter(str.strip, req.urls):
+            if parse_post_url(u):
+                targets.append(CrawlTarget(u.strip(), "post"))
+            else:
+                bad.append(u.strip())
+        for u in filter(str.strip, req.users):
+            if name := parse_username(u):
+                targets.append(CrawlTarget(name, "user"))
+            else:
+                bad.append(u.strip())
+        if bad:
+            raise HTTPException(400, "Không hiểu: " + ", ".join(bad[:3]))
         if not targets:
-            raise HTTPException(400, "Nhập ít nhất một từ khóa")
+            raise HTTPException(400, "Nhập ít nhất một từ khóa, link bài hoặc tài khoản")
         opts = CrawlOptions(
             limit=req.limit, replies=req.replies, min_likes=req.min_likes, recent=req.recent,
             media=req.media, headless=not req.show_browser, profile=profile,
@@ -99,7 +126,10 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
                 job_store.close()
             return {"posts": stats.posts, "replies": stats.replies, "errors": stats.errors}
 
-        title = ", ".join(t.query for t in targets[:3]) + (f" +{len(targets) - 3}" if len(targets) > 3 else "")
+        def short(t: CrawlTarget) -> str:
+            return f"🔗 {parse_post_url(t.query)[1]}" if t.kind == "post" else t.label
+
+        title = ", ".join(short(t) for t in targets[:3]) + (f" +{len(targets) - 3}" if len(targets) > 3 else "")
         return jobs.submit("crawl", f"Crawl: {title}", run)
 
     # ── Kho bài ──────────────────────────────────────────────────────────────
@@ -115,10 +145,15 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     @app.get("/api/posts")
     def posts(
         query: str | None = None, q: str | None = None,
-        sort: str = "likes", limit: int = 30, offset: int = 0,
+        sort: str = "likes", limit: int = 30, offset: int = 0, starred: bool = False,
     ):
-        items, total = store.list_posts(query, q, sort, limit, offset)
-        return {"items": [with_urls(p) for p in items], "total": total}
+        items, total = store.list_posts(query, q, sort, limit, offset, starred)
+        return {"items": [with_urls(p) for p in items], "total": total, "starred": store.count_starred()}
+
+    @app.put("/api/posts/{code}/star")
+    def star_post(code: str, req: StarRequest):
+        store.set_starred(code, req.starred)
+        return {"ok": True, "starred": store.count_starred()}
 
     @app.get("/api/posts/{code}")
     def post(code: str):
@@ -188,7 +223,7 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
 
     @app.post("/api/card")
     def card(req: CardRequest):
-        return png_response(video.card_image(req.segment, req.theme))
+        return png_response(video.card_image(req.segment, req.theme, scaled=False))
 
     @app.get("/api/text-image")
     def text_image(text: str):
@@ -198,16 +233,52 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     def start_render(project: video.Project):
         if not project.segments:
             raise HTTPException(400, "Timeline chưa có thẻ nào")
+        if code_stamp() > started_stamp:
+            # trình dựng (file tĩnh) đã là bản mới nhưng server còn code cũ → video xuất ra sẽ lệch bản chỉnh
+            raise HTTPException(409, "Code đã được cập nhật nhưng server chưa khởi động lại, video xuất ra sẽ khác "
+                                     "bản đang chỉnh. Hãy tắt rồi chạy lại `threads-crawler web`, sau đó bấm Xuất video.")
 
         def run(progress):
             job_store = Store(data_dir)
             try:
-                return video.render(job_store, project, progress)
+                result = video.render(job_store, project, progress)
+                if project.id:
+                    job_store.finish_project(project.id, result["id"])
+                return result | {"project_id": project.id}
             finally:
                 job_store.close()
 
         label = project.name.strip() or project.segments[0].display_text[:40]
         return jobs.submit("render", f"Video: {label}", run)
+
+    # ── Dự án đang dở ────────────────────────────────────────────────────────
+
+    @app.get("/api/projects")
+    def projects():
+        return store.list_projects()
+
+    @app.get("/api/projects/{project_id}")
+    def get_project(project_id: str):
+        p = store.get_project(project_id)
+        if p is None:
+            raise HTTPException(404, "Không tìm thấy dự án (có thể đã xuất video hoặc bị xóa)")
+        return p
+
+    @app.post("/api/projects/{project_id}")
+    async def save_project(project_id: str, request: Request):
+        # Nhận body thô: trình duyệt gửi bằng sendBeacon (text/plain) khi đóng trang.
+        try:
+            data = json.loads(await request.body())
+        except ValueError:
+            raise HTTPException(400, "Dữ liệu dự án không hợp lệ")
+        if not isinstance(data, dict):
+            raise HTTPException(400, "Dữ liệu dự án không hợp lệ")
+        return {"saved": store.save_project(project_id, data)}
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: str):
+        store.delete_project(project_id)
+        return {"ok": True}
 
     # ── Video đã xuất ────────────────────────────────────────────────────────
 

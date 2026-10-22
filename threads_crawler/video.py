@@ -3,8 +3,8 @@
 Mốc thời gian (phải khớp với `computeTimeline` trong static/app.js):
 - Các thẻ (segment) nối tiếp nhau trên hàng giọng đọc: bắt đầu sau LEAD_IN, mỗi thẻ dài
   = thời lượng giọng đọc / tốc độ + `hold`, giữa hai thẻ nghỉ `gap` giây.
-- Meme và chữ gắn (anchor) vào một thẻ: start = start của thẻ đó + offset. Đổi thứ tự thẻ thì
-  meme/chữ đi theo.
+- Meme, sfx và chữ gắn (anchor) vào một thẻ: start = start của thẻ đó + offset. Đổi thứ tự thẻ thì
+  chúng đi theo.
 - Nhạc tính theo giây tuyệt đối trên video.
 """
 
@@ -37,6 +37,14 @@ LEAD_IN = 0.35  # giây im lặng trước thẻ đầu
 TAIL = 0.9  # giây giữ hình sau thẻ cuối
 SILENT_SEGMENT = 2.5  # thẻ không có lời đọc vẫn hiện bấy nhiêu giây
 WORK_DIR = PROJECT_ROOT / ".cache" / "render"
+# Watermark mờ nảy khắp khung hình như logo DVD (phải khớp với WATERMARK trong static/editor.js).
+WATERMARK_TEXT = "@chillvideos666"
+WATERMARK_SPEED = (150, 110)  # px/giây theo x, y; khác nhau để đường đi không lặp lại sớm
+
+
+def bounce_expr(speed: int, span: str) -> str:
+    """ffmpeg expr: đi qua lại trong [0, span] với vận tốc `speed` (sóng tam giác)."""
+    return f"abs(mod(t*{speed},2*({span}))-({span}))"
 
 Position = Literal[
     "top-left", "top-center", "top-right",
@@ -67,6 +75,10 @@ class Segment(BaseModel):
     image_path: str | None = None
     page_label: str | None = None
     hold: float = Field(0.0, ge=0, le=60)  # giữ thẻ thêm sau khi đọc xong
+    scale: float = Field(1.0, ge=0.2, le=5)  # phóng to / thu nhỏ thẻ (nhấn mạnh), được tràn khung
+    dx: float = Field(0.0, ge=-3000, le=3000)  # dời thẻ khỏi vị trí giữa (px trên khung 1080x1920)
+    dy: float = Field(0.0, ge=-3000, le=3000)
+    voice: str | None = None  # giọng đọc riêng của thẻ; None = giọng chung của video
 
 
 class Anchor(BaseModel):
@@ -83,6 +95,14 @@ class MemeItem(BaseModel):
     size: float = Field(0.4, ge=0.1, le=1.0)  # tỉ lệ so với chiều ngang khung hình
     volume: float = Field(1.0, ge=0, le=2)
     chroma: bool | None = None  # None = tự phát hiện phông xanh
+
+
+class SfxItem(BaseModel):
+    id: str = Field(default_factory=new_id)
+    path: str  # tương đối trong materials/sfx
+    anchor: Anchor = Anchor()
+    duration: float | None = Field(None, gt=0)  # None = cả âm thanh
+    volume: float = Field(1.0, ge=0, le=2)
 
 
 class TextItem(BaseModel):
@@ -107,11 +127,13 @@ class Background(BaseModel):
 
 
 class Project(BaseModel):
+    id: str | None = None  # id dự án đang dở (xuất xong thì xóa dự án)
     name: str = ""
     post_codes: list[str] = []
     segments: list[Segment]
     texts: list[TextItem] = []
     memes: list[MemeItem] = []
+    sfx: list[SfxItem] = []
     music: list[MusicItem] = []
     background: Background
     voice: str = tts.DEFAULT_VOICE
@@ -176,18 +198,23 @@ def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_i
 # ── Bố cục & mốc thời gian ───────────────────────────────────────────────────
 
 
-def card_image(seg: Segment, theme: str) -> Image.Image:
-    return cards.render_card(
+def card_image(seg: Segment, theme: str, scaled: bool = True) -> Image.Image:
+    """Ảnh thẻ; `scaled` = phóng theo seg.scale (trình dựng tự phóng ảnh gốc khi xem trước)."""
+    img = cards.render_card(
         seg.username, seg.display_text, style="post" if seg.kind == "post" else "comment",
         avatar_path=seg.avatar_path, verified=seg.verified, published_at=seg.published_at,
         likes=seg.likes, replies=seg.replies, reposts=seg.reposts, image_path=seg.image_path,
         page_label=seg.page_label, theme=theme,
     )
+    if scaled and abs(seg.scale - 1) > 1e-3:
+        img = img.resize((round(img.width * seg.scale), round(img.height * seg.scale)), Image.LANCZOS)
+    return img
 
 
-def card_xy(card: Image.Image) -> tuple[int, int]:
+def card_xy(card: Image.Image, seg: Segment) -> tuple[int, int]:
+    """Tâm thẻ ở giữa dải [CARD_TOP, H - SAFE_BOTTOM], dời thêm (dx, dy); được tràn ra ngoài khung."""
     band = H - SAFE_BOTTOM - CARD_TOP
-    return (W - card.width) // 2, CARD_TOP + max(0, (band - card.height) // 2)
+    return round((W - card.width) / 2 + seg.dx), round(CARD_TOP + (band - card.height) / 2 + seg.dy)
 
 
 def text_xy(img: Image.Image, position: str) -> tuple[int, int]:
@@ -237,6 +264,12 @@ class Timeline:
             st = self.at(m.anchor)
             self.memes[m.id] = (st, st + min(m.duration or full, full))
             ends.append(self.memes[m.id][1])
+        self.sfx: dict[str, tuple[float, float]] = {}
+        for x in project.sfx:
+            full = media.probe(media.safe_material(x.path, "sfx"))["duration"]
+            st = self.at(x.anchor)
+            self.sfx[x.id] = (st, st + min(x.duration or full, full))
+            ends.append(self.sfx[x.id][1])
         for x in project.texts:
             if x.duration:
                 ends.append(self.at(x.anchor) + x.duration)
@@ -274,7 +307,8 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
     for i, seg in enumerate(p.segments):
         on_progress(0.5 * i / len(p.segments), f"Giọng đọc thẻ {i + 1}/{len(p.segments)}")
         if seg.read_text.strip():
-            audio, sr = sf.read(tts.synthesize(seg.read_text.strip(), p.voice, p.precision), dtype="float32")
+            wav = tts.synthesize(seg.read_text.strip(), seg.voice or p.voice, p.precision)
+            audio, sr = sf.read(wav, dtype="float32")
             clips[seg.id] = audio if audio.ndim == 1 else audio.mean(axis=1)
     tl = Timeline(p, {k: len(v) / sr for k, v in clips.items()})
     total = tl.total
@@ -296,7 +330,7 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         c = card_image(seg, p.theme)
         path = work / f"card_{i:03d}.png"
         c.save(path)
-        card_pngs.append((path, card_xy(c)))
+        card_pngs.append((path, card_xy(c, seg)))
     text_pngs = []
     for k, x in enumerate(p.texts):
         if not x.text.strip():
@@ -305,6 +339,8 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         path = work / f"text_{k:03d}.png"
         img.save(path)
         text_pngs.append((path, text_xy(img, x.position), tl.texts[x.id]))
+    watermark_png = work / "watermark.png"
+    cards.render_watermark(WATERMARK_TEXT).save(watermark_png)
 
     # 4. Lệnh ffmpeg
     bg = media.safe_material(p.background.path, "backgrounds")
@@ -326,7 +362,7 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
     filters = [f"[{i_bg}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[v0]"]
     cur, n = "v0", 0
 
-    def overlay(src: str, x: int, y: int, extra: str = "") -> None:
+    def overlay(src: str, x: int | str, y: int | str, extra: str = "") -> None:
         nonlocal cur, n
         n += 1
         filters.append(f"[{cur}][{src}]overlay={x}:{y}{extra}[v{n}]")
@@ -359,8 +395,23 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
             )
             labels.append(f"ma{k}")
 
+    for k, x in enumerate(p.sfx):
+        st, en = tl.sfx[x.id]
+        if st >= total or x.volume <= 0:
+            continue
+        i_s = add_input("-i", str(media.safe_material(x.path, "sfx")))
+        audio.append(
+            f"[{i_s}:a]atrim=0:{en - st:.3f},asetpts=PTS-STARTPTS,volume={x.volume:.2f},"
+            f"adelay={int(st * 1000)}:all=1[sx{k}]"
+        )
+        labels.append(f"sx{k}")
+
     for path, (x, y), (a, b) in text_pngs:  # chữ nằm trên cùng
         overlay(f"{add_input('-i', str(path))}:v", x, y, f":enable='between(t,{a:.3f},{b:.3f})'")
+
+    vx, vy = WATERMARK_SPEED
+    overlay(f"{add_input('-i', str(watermark_png))}:v",
+            f"'{bounce_expr(vx, 'main_w-overlay_w')}'", f"'{bounce_expr(vy, 'main_h-overlay_h')}'")
 
     for k, mu in enumerate(p.music):
         st = min(mu.start, total)
@@ -405,6 +456,7 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         "music_file": p.music[0].path if p.music else None,
         "segments": len(p.segments),
         "memes": len(p.memes),
+        "sfx": len(p.sfx),
     }
     title = p.name.strip() or next((x.text for x in p.texts if x.text.strip()), "") or p.segments[0].display_text[:80]
     out, thumb = store.place_video(out, thumb, store.video_dest(p.publish_at, title, first_code))

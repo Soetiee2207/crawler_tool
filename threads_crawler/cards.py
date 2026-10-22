@@ -427,6 +427,17 @@ def render_card(
     return out
 
 
+def render_watermark(text: str, size: int = 46, alpha: int = 90) -> Image.Image:
+    """Chữ trắng mờ viền tối nhẹ, dùng làm watermark chạy khắp video."""
+    f = font(size, True)
+    stroke = 2
+    x0, y0, x1, y1 = f.getbbox(text, stroke_width=stroke)
+    img = Image.new("RGBA", (x1 - x0 + 4, y1 - y0 + 4), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text((2 - x0, 2 - y0), text, font=f, fill=(255, 255, 255, alpha),
+                             stroke_width=stroke, stroke_fill=(0, 0, 0, alpha // 2))
+    return img
+
+
 def render_title(text: str, max_w: int = 980) -> Image.Image:
     """Bold white title with black outline (kiểu chữ TikTok), centered, tối đa 3 dòng."""
     f = font(64, True)

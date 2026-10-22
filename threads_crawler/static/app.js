@@ -132,9 +132,12 @@ function customKeywords() {
   return $("#customKeywords").value.split("\n").map((s) => s.trim()).filter(Boolean);
 }
 
+const lines = (sel) => $(sel).value.split("\n").map((s) => s.trim()).filter(Boolean);
+
 function updateCrawlSummary() {
-  const n = customKeywords().length;
-  $("#crawlSummary").textContent = n ? `Sẽ crawl ${n} từ khóa` : "Chưa nhập từ khóa nào";
+  const parts = [[customKeywords().length, "từ khóa"], [lines("#crawlUrls").length, "link bài"], [lines("#crawlUsers").length, "tài khoản"]]
+    .filter(([n]) => n).map(([n, what]) => `${n} ${what}`);
+  $("#crawlSummary").textContent = parts.length ? `Sẽ crawl ${parts.join(", ")}` : "Chưa nhập gì để crawl";
   const added = new Set(customKeywords().map((k) => k.toLowerCase()));
   $$("#tab-crawl [data-kw]").forEach((c) => c.classList.toggle("added", added.has(c.dataset.kw.toLowerCase())));
 }
@@ -201,7 +204,7 @@ $("#tab-crawl").addEventListener("click", (e) => {
   const chip = e.target.closest("[data-kw]");
   if (chip) toggleKeyword(chip.dataset.kw);
 });
-$("#customKeywords").oninput = updateCrawlSummary;
+$("#customKeywords").oninput = $("#crawlUrls").oninput = $("#crawlUsers").oninput = updateCrawlSummary;
 
 $("#startCrawl").onclick = async () => {
   try {
@@ -209,6 +212,8 @@ $("#startCrawl").onclick = async () => {
       method: "POST",
       body: {
         keywords: customKeywords(),
+        urls: lines("#crawlUrls"),
+        users: lines("#crawlUsers"),
         limit: +$("#optLimit").value,
         replies: +$("#optReplies").value,
         min_likes: +$("#optMinLikes").value,
@@ -237,23 +242,28 @@ async function loadQueries() {
 // ───────────────────────── Kho bài ─────────────────────────
 
 let postsOffset = 0;
+let starredOnly = false; // chỉ xem bài yêu thích (gắn sao)
 let postsSeq = 0;
 async function loadPosts(append = false) {
   if (!append) postsOffset = 0;
   const seq = ++postsSeq;
   const params = new URLSearchParams({ sort: $("#fSort").value, limit: 30, offset: postsOffset });
+  if (starredOnly) params.set("starred", "true");
   for (const [k, id] of [["query", "#fQuery"], ["q", "#fSearch"]]) {
     if ($(id).value) params.set(k, $(id).value);
   }
-  const { items, total } = await api("/api/posts?" + params);
+  const { items, total, starred } = await api("/api/posts?" + params);
   if (seq !== postsSeq) return; // một lần lọc mới hơn đã chạy
   state.posts = append ? [...state.posts, ...items] : items;
   state.postsTotal = total;
   postsOffset = state.posts.length;
   $("#postsCount").textContent = `${total} bài`;
+  updateStarFilter(starred);
   $("#postsGrid").innerHTML = state.posts.length
     ? state.posts.map(postCardHtml).join("")
-    : '<div class="empty panel muted">Chưa có bài nào. Sang tab Crawl để lấy dữ liệu.</div>';
+    : starredOnly
+      ? '<div class="empty panel muted">Chưa có bài yêu thích nào. Bấm ☆ trên bài để lưu lại làm content sau.</div>'
+      : '<div class="empty panel muted">Chưa có bài nào. Sang tab Crawl để lấy dữ liệu.</div>';
   $("#loadMore").classList.toggle("hidden", state.posts.length >= total);
 }
 
@@ -272,6 +282,7 @@ function postCardHtml(p) {
     <div class="post-head">${avatarHtml(p)}
       <div class="who"><b>${esc(p.username)}${p.user_verified ? " ✔️" : ""}</b>
         <span class="muted small">${p.published_at ? new Date(p.published_at).toLocaleDateString("vi-VN") : ""}</span></div>
+      ${starBtn(p)}
     </div>
     <div class="post-text">${esc(p.text)}</div>
     ${imgs.length ? `<div class="post-media">${imgs.map((m) => `<img src="${esc(m.src)}" loading="lazy">`).join("")}</div>` : ""}
@@ -289,6 +300,32 @@ function postCardHtml(p) {
   </div>`;
 }
 
+const starBtn = (p) => `<button class="star ${p.starred ? "on" : ""}" data-act="star"
+  title="${p.starred ? "Bỏ khỏi yêu thích" : "Lưu vào yêu thích để làm content sau"}">${p.starred ? "★" : "☆"}</button>`;
+
+function updateStarFilter(n) {
+  $("#fStarred").classList.toggle("on", starredOnly);
+  $("#fStarred").textContent = `${starredOnly ? "★" : "☆"} Yêu thích (${n})`;
+}
+
+async function toggleStar(code, btn) {
+  const post = state.posts.find((p) => p.code === code);
+  const on = !post?.starred;
+  try {
+    const r = await api(`/api/posts/${code}/star`, { method: "PUT", body: { starred: on } });
+    if (post) post.starred = on;
+    if (starredOnly && !on) return loadPosts();
+    btn.outerHTML = starBtn({ starred: on });
+    updateStarFilter(r.starred);
+    toast(on ? "⭐ Đã thêm vào Yêu thích" : "Đã bỏ khỏi Yêu thích");
+  } catch (e) { toast(e.message, true); }
+}
+
+$("#fStarred").onclick = () => {
+  starredOnly = !starredOnly;
+  loadPosts();
+};
+
 $("#postsGrid").onclick = async (e) => {
   const btn = e.target.closest("[data-act]");
   if (!btn) return;
@@ -299,6 +336,7 @@ $("#postsGrid").onclick = async (e) => {
     card.classList.toggle("picked", btn.checked);
     updatePickBar();
   }
+  if (btn.dataset.act === "star") return toggleStar(code, btn);
   if (btn.dataset.act === "make") Editor.createFromPosts([code]);
   if (btn.dataset.act === "view") openDrawer(code);
   if (btn.dataset.act === "del" && confirm("Xóa bài này và bình luận của nó khỏi kho?")) {
@@ -477,7 +515,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     state.voices = voices;
     state.materials = materials;
   } catch (e) { toast("Lỗi tải dữ liệu: " + e.message, true); }
-  Editor.init();
+  await Editor.init();
   loadSuggestions();
   pollJobs();
   showTab(store.get("tab", "crawl"));

@@ -109,19 +109,47 @@ class ThreadsCrawler:
         posts = [p for p in collector.posts.values() if not p["is_reply"]]
         return posts[:limit]
 
-    async def replies(self, post: dict, limit: int = 20) -> list[dict]:
-        """Open a post page and return its replies (excluding the post itself)."""
-        page, collector = await self._open(post["url"])
+    async def thread(self, url: str, code: str, limit: int = 20) -> tuple[dict | None, list[dict]]:
+        """Open a post page; return (bản đầy đủ của bài `code`, các reply của nó)."""
+        page, collector = await self._open(url)
         try:
             await _scroll_collect(page, collector, limit + 1, max_idle=2)
         finally:
             await page.close()
         # Trang chi tiết còn chứa bài "gợi ý" không liên quan (is_reply=False); chỉ giữ reply thật.
-        found = [p for code, p in collector.posts.items() if code != post["code"] and p["is_reply"]]
+        found = [p for c, p in collector.posts.items() if c != code and p["is_reply"]]
+        return collector.posts.get(code), found[:limit]
+
+    async def replies(self, post: dict, limit: int = 20) -> list[dict]:
+        """Open a post page and return its replies (excluding the post itself)."""
+        full, found = await self.thread(post["url"], post["code"], limit)
         # Bài chi tiết có thể chứa phiên bản đầy đủ hơn của post gốc (vd: text dài).
-        if full := collector.posts.get(post["code"]):
+        if full:
             post.update(merge_post(post, full))
-        return found[:limit]
+        return found
+
+    async def user_posts(self, username: str, limit: int = 30) -> list[dict]:
+        """Bài gốc (không tính reply, repost của người khác) trên trang cá nhân @username."""
+        url = f"{BASE_URL}/@{quote(username)}"
+        log.info("User: %s", url)
+        page, collector = await self._open(url)
+        own = lambda: [  # noqa: E731
+            p for p in collector.posts.values() if p["username"].lower() == username.lower() and not p["is_reply"]
+        ]
+        try:
+            idle = 0
+            while len(own()) < limit and idle < 4:
+                before = len(own())
+                await page.mouse.wheel(0, random.randint(2500, 4000))
+                await _human_pause()
+                await collector.scan_embedded(page)
+                idle = idle + 1 if len(own()) == before else 0
+                log.info("  ... %d bài của @%s", len(own()), username)
+        finally:
+            await page.close()
+        if not collector.posts:
+            raise RuntimeError(f"Không thấy bài nào của @{username} (sai tên hoặc tài khoản riêng tư?)")
+        return own()[:limit]
 
 
 class open_browser:

@@ -33,9 +33,21 @@
       </label>
       <div id="recentQueries" class="chips small"></div>
 
+      <h2>Link bài</h2>
+      <label class="field">
+        <span>Mỗi dòng một link — chỉ crawl đúng bài đó (kèm bình luận)</span>
+        <textarea id="crawlUrls" rows="3" placeholder="https://www.threads.com/@ten_user/post/DRqu9lIk_pT"></textarea>
+      </label>
+
+      <h2>Tài khoản</h2>
+      <label class="field">
+        <span>Mỗi dòng một tên tài khoản (hoặc link trang cá nhân) — crawl các bài người đó đăng</span>
+        <textarea id="crawlUsers" rows="3" placeholder="@ten_user&#10;https://www.threads.com/@ten_khac"></textarea>
+      </label>
+
       <h3>Tùy chọn</h3>
       <div class="opts">
-        <label class="field"><span>Số bài / từ khóa</span><input id="optLimit" type="number" value="20" min="1" max="200"></label>
+        <label class="field"><span>Số bài / từ khóa, tài khoản</span><input id="optLimit" type="number" value="20" min="1" max="200"></label>
         <label class="field"><span>Bình luận / bài</span><input id="optReplies" type="number" value="15" min="0" max="100"></label>
         <label class="field"><span>Ít nhất N likes</span><input id="optMinLikes" type="number" value="0" min="0"></label>
       </div>
@@ -45,7 +57,7 @@
         <label><input type="checkbox" id="optShow"> Hiện trình duyệt</label>
       </div>
       <div class="crawl-summary">
-        <span id="crawlSummary">Chưa nhập từ khóa nào</span>
+        <span id="crawlSummary">Chưa nhập gì để crawl</span>
         <button id="startCrawl" class="primary">Bắt đầu crawl</button>
       </div>
     </div>
@@ -76,6 +88,7 @@
         <option value="newest">Mới đăng</option>
         <option value="crawled">Mới crawl</option>
       </select>
+      <button id="fStarred" class="ghost star-filter" title="Chỉ hiện bài đã gắn sao">☆ Yêu thích</button>
       <span id="postsCount" class="muted"></span>
     </div>
     <div id="postsGrid" class="posts-grid"></div>
@@ -84,10 +97,13 @@
 
   <!-- ─────────────── TẠO VIDEO ─────────────── -->
   <section id="tab-create" class="tab">
-    <div id="createEmpty" class="empty panel">
-      <p>Chưa có video nào đang làm.</p>
-      <p class="muted small">Vào Kho bài, tick chọn một hoặc nhiều bài rồi bấm "Tạo video".</p>
-      <button class="primary" data-goto="library">Chọn bài trong Kho bài</button>
+    <div id="createEmpty" class="panel">
+      <div class="panel-head">
+        <h2>📁 Dự án đang làm dở</h2>
+        <button class="primary" data-goto="library">+ Video mới: chọn bài trong Kho bài</button>
+      </div>
+      <p class="muted small">Mọi chỉnh sửa được lưu tự động. Xuất video xong thì dự án tự xóa khỏi danh sách.</p>
+      <div id="projectList" class="project-list"></div>
     </div>
 
     <div id="editor" class="editor hidden">
@@ -95,7 +111,8 @@
         <input id="pName" class="ed-name" placeholder="Tên video (tùy chọn)">
         <button id="undoBtn" class="ghost sm" title="Hoàn tác (Ctrl+Z)">↶ Hoàn tác</button>
         <span id="ttsStatus" class="muted small grow"></span>
-        <button id="newProject" class="ghost sm">Video mới</button>
+        <span id="saveStatus" class="muted small"></span>
+        <button id="newProject" class="ghost sm" title="Lưu và quay về danh sách dự án">📁 Dự án</button>
         <button id="renderBtn" class="primary">🎬 Xuất video</button>
       </div>
 
@@ -127,7 +144,7 @@
         <div class="tl-toolbar">
           <button id="addText" class="ghost sm">+ Chữ</button>
           <button id="addMusic" class="ghost sm">+ Nhạc</button>
-          <span class="muted small">Kéo meme từ thư viện vào hàng Meme · kéo thẻ để đổi thứ tự · kéo mép phải để chỉnh độ dài</span>
+          <span class="muted small">Kéo meme / sfx từ thư viện vào hàng của nó, hoặc chọn thẻ rồi bấm meme / ➕ sfx để chèn theo thẻ · kéo thẻ để đổi thứ tự · kéo mép phải để chỉnh độ dài</span>
           <span class="grow"></span>
           <label class="inline small">Thu phóng <input id="zoom" type="range" min="8" max="140" value="32"></label>
           <button id="fitBtn" class="ghost sm">Vừa khung</button>
@@ -138,6 +155,7 @@
             <div class="tl-label">✏️ Chữ</div>
             <div class="tl-label seg">🗨️ Thẻ + giọng</div>
             <div class="tl-label">😹 Meme</div>
+            <div class="tl-label">🔊 SFX</div>
             <div class="tl-label">🎵 Nhạc</div>
             <div class="tl-label">🎞 Nền</div>
           </div>
@@ -147,16 +165,33 @@
               <div class="tl-row" data-row="text"></div>
               <div class="tl-row seg" data-row="seg"></div>
               <div class="tl-row" data-row="meme"></div>
+              <div class="tl-row" data-row="sfx"></div>
               <div class="tl-row" data-row="music"></div>
               <div class="tl-row" data-row="bg"></div>
               <div class="tl-playhead" id="tlPlayhead"></div>
             </div>
           </div>
         </div>
-        <div class="meme-lib-wrap">
-          <select id="memeCat" class="sm" title="Lọc meme theo nhóm"></select>
-          <div id="memeLib" class="meme-lib"></div>
+      </section>
+
+      <section class="ed-memes panel">
+        <div class="meme-lib-head">
+          <div class="seg-toggle" id="libTabs">
+            <button data-lib="memes">😹 Thư viện meme</button>
+            <button data-lib="sfx">🔊 Hiệu ứng âm thanh (SFX)</button>
+          </div>
+          <span class="lib-ctl" data-pane="memes">
+            <select id="memeCat" class="sm" title="Lọc meme theo nhóm"></select>
+            <input id="memeSearch" class="sm" placeholder="Tìm theo tên...">
+          </span>
+          <span class="lib-ctl hidden" data-pane="sfx">
+            <select id="sfxCat" class="sm" title="Lọc sfx theo tình huống"></select>
+            <input id="sfxSearch" class="sm" placeholder="Tìm sfx...">
+          </span>
+          <span id="memeHint" class="muted small grow"></span>
         </div>
+        <div id="memeLib" class="meme-lib"></div>
+        <div id="sfxLib" class="sfx-lib hidden"></div>
       </section>
     </div>
   </section>
@@ -178,6 +213,18 @@
   <div class="drawer-body">
     <button class="drawer-close" id="drawerClose">✕</button>
     <div id="drawerContent"></div>
+  </div>
+</div>
+<div id="memeModal" class="modal hidden">
+  <div class="modal-body">
+    <button class="drawer-close" id="memeModalClose">✕</button>
+    <h3 id="memeModalTitle"></h3>
+    <video id="memePreview" controls loop playsinline></video>
+    <p id="memeModalInfo" class="muted small"></p>
+    <div class="row gap">
+      <button id="memeInsert" class="primary"></button>
+      <button id="memeModalCancel" class="ghost">Đóng</button>
+    </div>
   </div>
 </div>
 <div id="toasts"></div>

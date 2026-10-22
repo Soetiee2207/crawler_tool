@@ -1,4 +1,4 @@
-"""Helpers around ffmpeg/ffprobe and the `materials/` library (background videos, music, memes)."""
+"""Helpers around ffmpeg/ffprobe and the `materials/` library (background videos, music, memes, sfx)."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ KINDS = {
     "backgrounds": ("background_videos", {".mp4", ".mov", ".mkv", ".webm"}),
     "music": ("background_musics", {".mp3", ".wav", ".m4a", ".ogg", ".aac"}),
     "memes": ("meme_video", {".mp4", ".mov", ".webm", ".gif"}),
+    "sfx": ("sfx", {".mp3", ".wav", ".m4a", ".ogg"}),  # âm thanh ngắn chèn vào tình huống
 }
 
 

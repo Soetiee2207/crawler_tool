@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS posts (
     avatar_path TEXT,          -- ảnh đại diện tác giả đã tải về
     media_json TEXT,           -- [{"type","url","path"}]
     crawled_at TEXT DEFAULT (datetime('now')),
-    used INTEGER DEFAULT 0     -- đánh dấu đã dùng làm video
+    used INTEGER DEFAULT 0,    -- đánh dấu đã dùng làm video
+    starred INTEGER DEFAULT 0  -- bài yêu thích (gắn sao) để làm content sau
 );
 CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(parent_code);
 CREATE INDEX IF NOT EXISTS idx_posts_query ON posts(query);
@@ -52,6 +53,19 @@ CREATE TABLE IF NOT EXISTS videos (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Dự án video đang dở (trạng thái trình dựng, lưu tự động); xuất video xong thì xóa.
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    data_json TEXT,
+    created_at TEXT,
+    updated_at TEXT            -- lần chỉnh/lưu cuối (giờ máy, ISO có múi giờ)
+);
+-- Dự án đã xuất video: chặn trình dựng còn mở lưu lại (hồi sinh) dự án đã xóa.
+CREATE TABLE IF NOT EXISTS finished_projects (
+    id TEXT PRIMARY KEY,
+    video_id INTEGER
+);
+
 -- Bài đã làm video: xóa khỏi kho, chỉ giữ lại dấu vết để crawl lại không bị thêm vào nữa.
 CREATE TABLE IF NOT EXISTS done_posts (
     code TEXT PRIMARY KEY,
@@ -65,7 +79,7 @@ CREATE TABLE IF NOT EXISTS done_posts (
 
 # Cột thêm sau phiên bản đầu; DB cũ được bổ sung khi mở.
 MIGRATIONS = {
-    "posts": {"reply_to_username": "TEXT", "avatar_path": "TEXT"},
+    "posts": {"reply_to_username": "TEXT", "avatar_path": "TEXT", "starred": "INTEGER DEFAULT 0"},
     "videos": {"publish_at": "TEXT"},
 }
 
@@ -78,6 +92,7 @@ def _row_to_post(row: sqlite3.Row) -> dict:
     d["media"] = json.loads(d.pop("media_json") or "[]")
     d["user_verified"] = bool(d["user_verified"])
     d["used"] = bool(d["used"])
+    d["starred"] = bool(d.get("starred"))
     return d
 
 
@@ -130,9 +145,9 @@ class Store:
     ) -> None:
         if self.is_done(post["code"]) or (parent_code and self.is_done(parent_code)):
             return
-        # Giữ lại đường dẫn media đã tải và trạng thái đã dùng nếu post được crawl lại.
+        # Giữ lại đường dẫn media đã tải, trạng thái đã dùng và sao nếu post được crawl lại.
         old = self.db.execute(
-            "SELECT media_json, used, avatar_path FROM posts WHERE code = ?", (post["code"],)
+            "SELECT media_json, used, avatar_path, starred FROM posts WHERE code = ?", (post["code"],)
         ).fetchone()
         if old:
             old_paths = {m["url"]: m.get("path") for m in json.loads(old["media_json"] or "[]")}
@@ -142,14 +157,15 @@ class Store:
             """INSERT OR REPLACE INTO posts
                (code, id, url, username, user_verified, text, published_at, like_count, reply_count,
                 repost_count, quote_count, parent_code, reply_to_username, query, avatar_path,
-                media_json, used)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                media_json, used, starred)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 post["code"], post["id"], post["url"], post["username"], int(post["user_verified"]),
                 post["text"], post["published_at"], post["like_count"], post["reply_count"],
                 post["repost_count"], post["quote_count"], parent_code, post["reply_to_username"], query,
                 post.get("avatar_path") or (old["avatar_path"] if old else None),
                 json.dumps(post["media"], ensure_ascii=False), old["used"] if old else 0,
+                (old["starred"] or 0) if old else 0,
             ),
         )
         self.db.commit()
@@ -206,6 +222,13 @@ class Store:
         self.db.execute("DELETE FROM posts WHERE code = ? OR parent_code = ?", (code, code))
         self.db.commit()
 
+    def set_starred(self, code: str, starred: bool) -> None:
+        self.db.execute("UPDATE posts SET starred = ? WHERE code = ? AND parent_code IS NULL", (int(starred), code))
+        self.db.commit()
+
+    def count_starred(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM posts WHERE starred = 1 AND parent_code IS NULL").fetchone()[0]
+
     # ── Đọc dữ liệu cho giao diện ─────────────────────────────────────────────
 
     def list_queries(self) -> list[dict]:
@@ -222,8 +245,11 @@ class Store:
         sort: str = "likes",
         limit: int = 50,
         offset: int = 0,
+        starred: bool = False,
     ) -> tuple[list[dict], int]:
         where, args = ["parent_code IS NULL"], []
+        if starred:
+            where.append("starred = 1")
         if query:
             where.append("query = ?")
             args.append(query)
@@ -265,6 +291,55 @@ class Store:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         return len(result)
+
+    # ── Dự án đang dở ─────────────────────────────────────────────────────────
+
+    def save_project(self, project_id: str, data: dict) -> bool:
+        """Lưu (ghi đè) dự án. False nếu dự án này đã xuất video rồi."""
+        if self.db.execute("SELECT 1 FROM finished_projects WHERE id = ?", (project_id,)).fetchone():
+            return False
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.db.execute(
+            """INSERT INTO projects (id, data_json, created_at, updated_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at""",
+            (project_id, json.dumps(data, ensure_ascii=False), now, now),
+        )
+        self.db.commit()
+        return True
+
+    def get_project(self, project_id: str) -> dict | None:
+        row = self.db.execute("SELECT data_json FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return json.loads(row["data_json"]) if row else None
+
+    def list_projects(self) -> list[dict]:
+        """Tóm tắt các dự án đang dở, mới chỉnh gần nhất trước."""
+        result = []
+        for row in self.db.execute("SELECT * FROM projects ORDER BY updated_at DESC"):
+            d = json.loads(row["data_json"] or "{}")
+            segs = d.get("segments") or []
+            result.append({
+                "id": row["id"],
+                "name": d.get("name") or "",
+                "preview": next((s.get("display_text") for s in segs if s.get("display_text")), ""),
+                "usernames": list(dict.fromkeys(s.get("username") for s in segs if s.get("kind") == "post")),
+                "posts": len(d.get("post_codes") or []),
+                "segments": len(segs),
+                "memes": len(d.get("memes") or []),
+                "sfx": len(d.get("sfx") or []),
+                "publish_at": d.get("publish_at"),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+        return result
+
+    def delete_project(self, project_id: str) -> None:
+        self.db.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        self.db.commit()
+
+    def finish_project(self, project_id: str, video_id: int) -> None:
+        """Đã xuất video: xóa tiến trình và ghi nhớ để không bị lưu lại."""
+        self.db.execute("INSERT OR REPLACE INTO finished_projects (id, video_id) VALUES (?, ?)", (project_id, video_id))
+        self.delete_project(project_id)
 
     # ── Video đã xuất ─────────────────────────────────────────────────────────
 
