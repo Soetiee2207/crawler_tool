@@ -366,7 +366,16 @@ function replyHtml(r, post, order = 0) {
       ${r.reply_to_username && !self ? `<span class="muted small"> → @${esc(r.reply_to_username)}</span>` : ""}
       <span class="muted small"> · ❤️ ${fmt(r.like_count)}</span>
       <p>${esc(r.text)}</p>
+      ${mediaThumbsHtml(r)}
     </div></div>`;
+}
+
+function mediaThumbsHtml(p) {
+  const items = p.media.filter((m) => m.src);
+  if (!items.length) return "";
+  return `<div class="post-media">${items.map((m) => m.type === "video"
+    ? `<video src="${esc(m.src)}" muted preload="metadata"></video>`
+    : `<img src="${esc(m.src)}" loading="lazy">`).join("")}</div>`;
 }
 
 // ───────────────────────── Video đã xuất ─────────────────────────

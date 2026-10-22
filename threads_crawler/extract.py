@@ -43,11 +43,22 @@ def _best_image(item: dict) -> str | None:
     return best.get("url")
 
 
+def _giphy_image(item: dict) -> str | None:
+    """Bình luận bằng GIF: ảnh không nằm trong image_versions2 mà trong giphy_media_info."""
+    info = item.get("giphy_media_info") or (item.get("text_post_app_info") or {}).get("giphy_media_info") or {}
+    images = info.get("first_party_cdn_proxied_images") or info.get("images") or {}
+    versions = [v for v in images.values() if isinstance(v, dict) and v.get("url")]
+    if not versions:
+        return info.get("url")
+    best = max(versions, key=lambda v: int(v.get("width") or 0) * int(v.get("height") or 0))
+    return best["url"]
+
+
 def _media_of(item: dict) -> list[dict]:
     videos = item.get("video_versions") or []
     if videos:
         return [{"type": "video", "url": videos[0].get("url"), "thumbnail": _best_image(item)}]
-    image = _best_image(item)
+    image = _best_image(item) or _giphy_image(item)
     return [{"type": "image", "url": image}] if image else []
 
 
