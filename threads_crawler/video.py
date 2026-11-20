@@ -35,7 +35,7 @@ CARD_TOP = 300  # thẻ được canh giữa trong dải [CARD_TOP, H - SAFE_BOT
 SAFE_BOTTOM = 300  # vùng caption/nút của TikTok
 LEAD_IN = 0.35  # giây im lặng trước thẻ đầu
 TAIL = 0.9  # giây giữ hình sau thẻ cuối
-SILENT_SEGMENT = 2.5  # thẻ không có lời đọc vẫn hiện bấy nhiêu giây
+SILENT_SEGMENT = 2.5  # mặc định: thẻ không có lời đọc vẫn hiện bấy nhiêu giây
 WORK_DIR = PROJECT_ROOT / ".cache" / "render"
 # Watermark mờ nảy khắp khung hình như logo DVD (phải khớp với WATERMARK trong static/editor.js).
 WATERMARK_TEXT = "@chillvideos666"
@@ -74,11 +74,23 @@ class Segment(BaseModel):
     reposts: int | None = None
     image_path: str | None = None
     page_label: str | None = None
+    badge: str | None = None  # đánh giá sản phẩm: số sao và nguồn trên đầu thẻ
     hold: float = Field(0.0, ge=0, le=60)  # giữ thẻ thêm sau khi đọc xong
+    silent: float | None = Field(None, ge=0.1, le=60)  # thời lượng khi không có lời đọc; None = theo dự án
     scale: float = Field(1.0, ge=0.2, le=5)  # phóng to / thu nhỏ thẻ (nhấn mạnh), được tràn khung
     dx: float = Field(0.0, ge=-3000, le=3000)  # dời thẻ khỏi vị trí giữa (px trên khung 1080x1920)
     dy: float = Field(0.0, ge=-3000, le=3000)
+    # cắt bớt mép thẻ [trái, trên, phải, dưới], tính theo tỉ lệ cạnh thẻ; phần còn lại giữ nguyên chỗ
+    crop: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     voice: str | None = None  # giọng đọc riêng của thẻ; None = giọng chung của video
+
+    @field_validator("crop")
+    @classmethod
+    def _crop(cls, v: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        l, t, r, b = (min(max(x, 0.0), 0.95) for x in v)
+        if l + r > 0.95 or t + b > 0.95:
+            raise ValueError("crop chừa lại quá ít")
+        return l, t, r, b
 
 
 class Anchor(BaseModel):
@@ -93,7 +105,7 @@ class MemeItem(BaseModel):
     duration: float | None = Field(None, gt=0)  # None = cả meme
     position: Position = "bottom-right"
     size: float = Field(0.4, ge=0.1, le=1.0)  # tỉ lệ so với chiều ngang khung hình
-    volume: float = Field(1.0, ge=0, le=2)
+    volume: float = Field(0.6, ge=0, le=2)
     chroma: bool | None = None  # None = tự phát hiện phông xanh
 
 
@@ -102,7 +114,7 @@ class SfxItem(BaseModel):
     path: str  # tương đối trong materials/sfx
     anchor: Anchor = Anchor()
     duration: float | None = Field(None, gt=0)  # None = cả âm thanh
-    volume: float = Field(1.0, ge=0, le=2)
+    volume: float = Field(0.6, ge=0, le=2)
 
 
 class TextItem(BaseModel):
@@ -118,7 +130,7 @@ class MusicItem(BaseModel):
     path: str  # tương đối trong materials/background_musics
     start: float = Field(0.0, ge=0)
     end: float | None = None  # None = đến hết video
-    volume: float = Field(0.15, ge=0, le=1)
+    volume: float = Field(0.4, ge=0, le=1)
 
 
 class Background(BaseModel):
@@ -140,7 +152,9 @@ class Project(BaseModel):
     precision: Literal["fp32", "int8"] = "fp32"
     speed: float = Field(1.1, ge=0.7, le=1.8)
     gap: float = Field(0.35, ge=0, le=5)
+    silent: float = Field(SILENT_SEGMENT, ge=0.1, le=60)  # thời lượng mặc định của thẻ không có lời đọc
     theme: Literal["light", "dark"] = "dark"
+    keep_posts: bool = False  # xuất xong vẫn giữ bài trong kho (vd. để làm phần 2)
     publish_at: str | None = None  # giờ dự định đăng, "YYYY-MM-DDTHH:MM" -> quyết định thư mục chứa video
 
     @field_validator("publish_at")
@@ -158,13 +172,20 @@ def first_image(post: dict) -> str | None:
     return next((m["path"] for m in post["media"] if m["type"] == "image" and m.get("path")), None)
 
 
+def is_self_thread(reply: dict, post: dict) -> bool:
+    """Phần tác giả viết tiếp bài (khác tác giả trả lời người bình luận). Dữ liệu cũ chưa có thread_code."""
+    if reply.get("thread_code"):
+        return reply["thread_code"] == post["code"]
+    return reply["username"] == post["username"]
+
+
 def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_image: bool = True) -> list[Segment]:
     """Turn a post + chosen replies (theo thứ tự chọn) into card segments with default read text."""
     by_code = {r["code"]: r for r in post["replies"]}
     segments: list[Segment] = []
 
     def add(p: dict, kind: str) -> None:
-        is_continuation = kind == "reply" and p["username"] == post["username"]
+        is_continuation = kind == "reply" and is_self_thread(p, post)
         image = first_image(p) if with_image else None
         width = cards.POST_TEXT_W if kind == "post" else cards.COMMENT_TEXT_W
         pages = cards.paginate(p["text"], max_lines - (5 if image else 0), width) if p["text"].strip() else [""]
@@ -186,6 +207,7 @@ def build_script(post: dict, reply_codes: list[str], max_lines: int = 11, with_i
                 reposts=p["repost_count"] if i == last else None,
                 image_path=image if i == 0 else None,
                 page_label=f"{i + 1}/{len(pages)}" if len(pages) > 1 else None,
+                badge=p.get("badge"),
             ))
 
     add(post, "post")
@@ -204,7 +226,7 @@ def card_image(seg: Segment, theme: str, scaled: bool = True) -> Image.Image:
         seg.username, seg.display_text, style="post" if seg.kind == "post" else "comment",
         avatar_path=seg.avatar_path, verified=seg.verified, published_at=seg.published_at,
         likes=seg.likes, replies=seg.replies, reposts=seg.reposts, image_path=seg.image_path,
-        page_label=seg.page_label, theme=theme,
+        page_label=seg.page_label, badge=seg.badge, theme=theme,
     )
     if scaled and abs(seg.scale - 1) > 1e-3:
         img = img.resize((round(img.width * seg.scale), round(img.height * seg.scale)), Image.LANCZOS)
@@ -215,6 +237,18 @@ def card_xy(card: Image.Image, seg: Segment) -> tuple[int, int]:
     """Tâm thẻ ở giữa dải [CARD_TOP, H - SAFE_BOTTOM], dời thêm (dx, dy); được tràn ra ngoài khung."""
     band = H - SAFE_BOTTOM - CARD_TOP
     return round((W - card.width) / 2 + seg.dx), round(CARD_TOP + (band - card.height) / 2 + seg.dy)
+
+
+def placed_card(seg: Segment, theme: str) -> tuple[Image.Image, tuple[int, int]]:
+    """Ảnh thẻ đã phóng + cắt, kèm góc trên-trái trên khung hình (phần cắt còn lại không dời chỗ)."""
+    img = card_image(seg, theme)
+    x, y = card_xy(img, seg)
+    l, t, r, b = seg.crop
+    if any(seg.crop):
+        box = (round(img.width * l), round(img.height * t), round(img.width * (1 - r)), round(img.height * (1 - b)))
+        img = img.crop(box)
+        x, y = x + box[0], y + box[1]
+    return img, (x, y)
 
 
 def text_xy(img: Image.Image, position: str) -> tuple[int, int]:
@@ -251,7 +285,7 @@ class Timeline:
         t = LEAD_IN
         for s in project.segments:
             voice = voice_durations.get(s.id)
-            length = (voice / project.speed if voice else SILENT_SEGMENT) + s.hold
+            length = (voice / project.speed if voice else (s.silent or project.silent)) + s.hold
             self.seg[s.id] = (t, t + length)
             t += length + project.gap
         self.segments_end = t - project.gap if project.segments else LEAD_IN
@@ -327,10 +361,10 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
     shows = list(zip(starts, starts[1:] + [total]))  # thẻ hiện đến khi thẻ sau bắt đầu
     card_pngs = []
     for i, seg in enumerate(p.segments):
-        c = card_image(seg, p.theme)
+        c, xy = placed_card(seg, p.theme)
         path = work / f"card_{i:03d}.png"
         c.save(path)
-        card_pngs.append((path, card_xy(c, seg)))
+        card_pngs.append((path, xy))
     text_pngs = []
     for k, x in enumerate(p.texts):
         if not x.text.strip():
@@ -418,7 +452,7 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
         en = min(mu.end if mu.end is not None else total, total)
         if en - st < 0.3:
             continue
-        i_mu = add_input("-stream_loop", "-1", "-i", str(media.safe_material(mu.path, "music")))
+        i_mu = add_input("-stream_loop", "-1", "-i", str(media.normalized_music(media.safe_material(mu.path, "music"))))
         d = en - st
         audio.append(
             f"[{i_mu}:a]atrim=0:{d:.3f},asetpts=PTS-STARTPTS,volume={mu.volume:.3f},"
@@ -461,7 +495,8 @@ def _render(store: Store, p: Project, work: Path, on_progress) -> dict:
     title = p.name.strip() or next((x.text for x in p.texts if x.text.strip()), "") or p.segments[0].display_text[:80]
     out, thumb = store.place_video(out, thumb, store.video_dest(p.publish_at, title, first_code))
     video_id = store.add_video(first_code, title, out, thumb, round(total, 2), config, p.publish_at)
-    store.archive_used(p.post_codes or [first_code], video_id)
+    if not p.keep_posts:
+        store.archive_used(p.post_codes or [first_code], video_id)
     on_progress(1.0, "Xong")
     return {"id": video_id, "path": str(out), "duration": total}
 

@@ -70,6 +70,23 @@ def safe_material(rel: str, kind: str) -> Path:
     return p
 
 
+# Nhạc nền chuẩn hóa về cùng độ to (bài kinh dị vốn nhỏ hơn bài hài ~6 dB, lại nhiều đoạn rất êm):
+# dynaudnorm nâng các đoạn êm, loudnorm đưa cả bài về -14 LUFS. Xem trước và xuất video dùng chung
+# file này, nên âm lượng chỉnh trong trình dựng nghe thế nào thì video ra đúng như vậy.
+MUSIC_NORM_FILTER = "dynaudnorm=f=250:g=15:p=0.9,loudnorm=I=-14:TP=-1.5:LRA=7"
+
+
+def normalized_music(src: Path) -> Path:
+    out = _thumb_path(src, "music-norm-v1", "m4a")
+    if not out.exists():
+        tmp = out.with_suffix(".tmp.m4a")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-vn", "-af", MUSIC_NORM_FILTER,
+             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", str(tmp)])
+        tmp.replace(out)
+    return out
+
+
 def list_materials() -> dict:
     """{kind: [{path (relative), name, category, duration}]}; category = tên thư mục con."""
     result: dict[str, list[dict]] = {}

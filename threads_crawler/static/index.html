@@ -14,29 +14,252 @@
     <button data-tab="library">Kho bài</button>
     <button data-tab="create">Tạo video</button>
     <button data-tab="videos">Video đã xuất</button>
+    <button data-tab="product">Sản phẩm</button>
+    <button data-tab="shopee">Review Shopee</button>
+    <button data-tab="studio">Video review</button>
+    <button data-tab="live">LIVE</button>
   </nav>
   <div class="jobs-wrap">
+    <div id="jobNow" class="job-now hidden">
+      <span class="spin">⏳</span>
+      <span class="t" data-openjob title="Xem chi tiết"></span>
+      <b class="pct"></b>
+      <span class="q muted"></span>
+      <button class="sm danger stop" title="Dừng tác vụ đang chạy">⏹ Dừng</button>
+    </div>
     <button id="jobsBtn" class="jobs-btn">Tác vụ <span id="jobsBadge" class="badge hidden">0</span></button>
     <div id="jobsPanel" class="jobs-panel hidden"></div>
   </div>
 </header>
 
 <main>
+  <!-- ─────────────── SẢN PHẨM ─────────────── -->
+  <section id="tab-product" class="tab">
+    <div class="panel product-form">
+      <h2>Video sản phẩm</h2>
+      <p class="muted small">Tạo thẻ giới thiệu, các thẻ đánh giá và thẻ kêu gọi cuối video, rồi mở trong trình dựng để chỉnh tiếp.</p>
+      <label class="field"><span>Link Shopee (tool điền sẵn các ô bên dưới, bạn kiểm tra lại trước khi tạo)</span>
+        <div class="prod-fetch"><input id="prodUrl" placeholder="https://shopee.vn/..."><button id="prodFetch">Lấy thông tin</button></div>
+      </label>
+      <p id="prodFetchInfo" class="muted small"></p>
+      <label class="field"><span>Tên sản phẩm</span><input id="prodName" maxlength="200"></label>
+      <div class="opts">
+        <label class="field"><span>Giá (tùy chọn, đúng với giá đang bán)</span><input id="prodPrice" maxlength="60" placeholder="199.000đ"></label>
+        <label class="field"><span>Ảnh sản phẩm</span><input id="prodImage" type="file" accept="image/*"></label>
+      </div>
+      <label class="field"><span>Lời giới thiệu</span><textarea id="prodIntro" rows="4" maxlength="3000"></textarea></label>
+      <label class="field"><span>Nguồn đánh giá (hiện trên từng thẻ)</span><input id="prodSource" maxlength="30" placeholder="Shopee"></label>
+      <label class="field">
+        <span>Đánh giá thật của người mua, mỗi dòng một đánh giá: <code>nội dung</code> hoặc <code>tên | sao | nội dung</code>. Tên sẽ được che bớt.</span>
+        <textarea id="prodReviews" rows="8" maxlength="50000" placeholder="n***h | 5 | Vải mát, giao nhanh, đúng như mô tả&#10;4 | Dùng ổn nhưng hơi nhỏ so với hình&#10;Đóng gói kỹ, sẽ mua lại"></textarea>
+      </label>
+      <label class="field"><span>Thẻ kêu gọi cuối video (bỏ trống nếu không cần)</span><input id="prodCta" maxlength="300" value="Link sản phẩm ở giỏ hàng bên dưới nhé!"></label>
+      <button id="prodCreate" class="primary big">🎬 Tạo video sản phẩm</button>
+    </div>
+  </section>
+
+  <!-- ─────────────── REVIEW SHOPEE ─────────────── -->
+  <section id="tab-shopee" class="tab">
+    <div class="sr-grid">
+      <div class="sr-side">
+        <div class="panel">
+          <h2>Ghi review từ Chrome</h2>
+          <ol class="sr-steps small">
+            <li>Mở <code>chrome://extensions</code>, bật <b>Developer mode</b>, chọn <b>Load unpacked</b> rồi trỏ tới thư mục <code>chrome_extension</code> của dự án (chỉ làm một lần).</li>
+            <li>Giữ app này chạy, bấm biểu tượng extension và bật <b>Ghi review đang xem</b>.</li>
+            <li>Trên Chrome, mở sản phẩm, lọc review có video và tự bấm qua các trang. Review hiện ở đây sau vài giây.</li>
+          </ol>
+        </div>
+        <details class="panel sr-auto">
+          <summary><b>Thu thập tự động</b> <span class="muted small">(Shopee có thể chặn)</span></summary>
+          <label class="field"><span>Link sản phẩm Shopee, mỗi dòng một link</span>
+            <textarea id="srUrls" rows="4" placeholder="https://shopee.vn/ten-san-pham-i.123.456"></textarea>
+          </label>
+          <p id="srUrlsInfo" class="muted small sr-hint"></p>
+          <label class="field"><span>Số đánh giá tối đa mỗi sản phẩm (tính mọi đánh giá, không chỉ đánh giá có video)</span>
+            <input id="srLimit" type="number" min="1" max="5000" value="200">
+          </label>
+          <label class="sr-switch">
+            <input id="srVideos" type="checkbox">
+            <span class="sr-track"></span>
+            <span class="sr-switch-text"><b>Tải video trong review</b><em id="srVideosInfo" class="small"></em></span>
+          </label>
+          <p id="srRights" class="sr-note small hidden">Quyền với video vẫn thuộc về người mua. Cần họ đồng ý trước khi đăng lại hoặc dùng để bán hàng.</p>
+          <details class="sr-more">
+            <summary class="muted small">Tùy chọn nâng cao</summary>
+            <div class="opts">
+              <label class="field"><span>Nghỉ giữa hai trang (giây)</span><input id="srDelay" type="number" min="1" max="60" value="3"></label>
+              <label class="field"><span>Timeout (giây)</span><input id="srTimeout" type="number" min="5" max="300" value="45"></label>
+              <label class="field"><span>Số lần thử lại</span><input id="srRetries" type="number" min="0" max="5" value="2"></label>
+            </div>
+            <label class="inline small"><input id="srRefresh" type="checkbox"> Quét lại cả sản phẩm đã lấy hết đánh giá</label>
+          </details>
+          <button id="srStart" class="primary big">Bắt đầu thu thập</button>
+          <p class="muted small sr-hint">Tool mở một cửa sổ trình duyệt, đừng đóng cửa sổ đó khi đang chạy. Nếu Shopee đòi đăng nhập hoặc xác minh, bạn tự làm trong đó. Nếu Shopee chặn, hãy dùng cách ghi từ Chrome ở trên.</p>
+        </details>
+        <div id="srJob" class="panel sr-job hidden">
+          <div class="panel-head"><b id="srJobTitle"></b><button id="srJobStop" class="sm danger">⏹ Dừng</button></div>
+          <div class="progress"><div></div></div>
+          <p id="srJobMsg" class="small"></p>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h2>Sản phẩm đã thu thập</h2><span id="srAll" class="small"></span></div>
+          <div id="srProducts"></div>
+        </div>
+      </div>
+      <div class="panel sr-main">
+        <div id="srEmpty" class="empty muted">Chọn một sản phẩm để xem review.</div>
+        <div id="srDetail" class="hidden">
+          <div class="panel-head">
+            <div class="grow"><h2 id="srName"></h2><div id="srMeta" class="muted small"></div></div>
+            <div id="srActions" class="row gap wrap"></div>
+          </div>
+          <div class="filters sr-filters">
+            <label class="inline"><input id="srVideoOnly" type="checkbox"> Chỉ review có video</label>
+            <label class="inline"><input id="srPickedOnly" type="checkbox"> Chỉ review đã chọn</label>
+            <select id="srRating"></select>
+            <input id="srSearch" placeholder="Tìm trong nội dung review">
+          </div>
+          <div id="srList"></div>
+          <div id="srPager" class="row gap sr-pager"></div>
+        </div>
+      </div>
+    </div>
+    <div id="srPickBar" class="pick-bar hidden">
+      <span id="srPickCount"></span>
+      <button id="srPickClear" class="ghost">Bỏ chọn</button>
+      <a id="srTestList" download><button>📋 Danh sách test</button></a>
+      <button id="srPickVideos">⬇ Tải video đã chọn</button>
+      <button id="srPickStudio" class="primary">🎬 Đưa vào Video review</button>
+    </div>
+  </section>
+
+  <!-- ─────────────── VIDEO REVIEW ─────────────── -->
+  <section id="tab-studio" class="tab">
+    <div class="rs-grid">
+      <div class="panel rs-lib">
+        <h2>Nguồn</h2>
+        <h3>Review đã đồng ý</h3>
+        <p id="rsWaiting" class="sr-bad small"></p>
+        <div id="rsReviews"></div>
+        <div class="panel-head rs-up-head">
+          <h3>File của tôi</h3>
+          <label class="upload-btn sm">⬆ Thêm file<input id="rsUpload" type="file" accept="video/*,image/*" multiple hidden></label>
+        </div>
+        <div id="rsUploads" class="rs-uploads"></div>
+      </div>
+      <div class="panel rs-seq">
+        <div class="panel-head"><h2>Thứ tự ghép</h2><span id="rsTotal" class="muted small"></span></div>
+        <div class="row gap wrap rs-settings">
+          <input id="rsTitle" class="grow" maxlength="120" placeholder="Tên video (tùy chọn)">
+          <select id="rsFit" title="Cách đưa về khung dọc 9:16">
+            <option value="blur">Giữ nguyên hình, nền mờ</option>
+            <option value="crop">Cắt đầy khung</option>
+          </select>
+        </div>
+        <div class="row gap wrap rs-settings">
+          <button id="rsScript" class="sm" disabled>📝 Tạo lời đọc từ dữ liệu</button>
+          <select id="rsVoice" title="Giọng đọc AI"></select>
+          <select id="rsSpeed" title="Tốc độ đọc">
+            <option value="1">Tốc độ 1.0</option>
+            <option value="1.1">Tốc độ 1.1</option>
+            <option value="1.2">Tốc độ 1.2</option>
+            <option value="1.3">Tốc độ 1.3</option>
+          </select>
+        </div>
+        <p id="rsEmpty" class="empty muted">Bấm vào video hoặc ảnh ở cột Nguồn để thêm. Kéo các mục để đổi thứ tự.</p>
+        <div id="rsList"></div>
+      </div>
+      <div class="panel rs-preview">
+        <div id="rsFrame" class="rs-frame">
+          <video id="rsPlayer" class="hidden" playsinline controls></video>
+          <img id="rsStill" class="hidden" alt="" referrerpolicy="no-referrer">
+        </div>
+        <button id="rsPlay" class="rs-play">▶ Xem toàn bộ</button>
+        <button id="rsExport" class="primary big" disabled>🎬 Xuất video</button>
+        <p class="muted small sr-hint">Video xuất ra không có nhạc, bạn chọn nhạc khi đăng lên TikTok. Bản xem trước chỉ gần đúng: chưa có giọng đọc (bấm 🔊 để nghe từng đoạn) và chưa có nền mờ. Nếu có giọng AI, hãy bật nhãn nội dung AI khi đăng.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─────────────── LIVE ─────────────── -->
+  <section id="tab-live" class="tab">
+    <div class="live-grid">
+      <div>
+        <div class="panel">
+          <h2>Kết nối TikTok LIVE</h2>
+          <label class="field">
+            <span>Tên kênh đang live (bắt đầu phát trên TikTok trước rồi mới kết nối)</span>
+            <input id="liveUser" placeholder="@ten_kenh">
+          </label>
+          <div class="live-actions">
+            <button id="liveConnect" class="primary">Kết nối</button>
+            <button id="liveDisconnect">Ngắt kết nối</button>
+            <span id="liveStatus" class="live-status"></span>
+          </div>
+          <p id="liveError" class="live-error"></p>
+          <p id="liveWorldInfo" class="muted small"></p>
+        </div>
+        <div class="panel">
+          <h2>Phát lên TikTok qua OBS</h2>
+          <ol class="live-steps">
+            <li>Trong OBS, đặt Canvas và Output là 1080×1920.</li>
+            <li>Thêm Browser Source, cỡ 1080×1920, URL: <code id="liveStageUrl"></code></li>
+            <li>Trong Browser Source, tick <b>Control audio via OBS</b>, rồi chỉnh âm lượng nó trong Audio Mixer. Không tick thì nhạc không lên live.</li>
+            <li>Dán Server và Stream Key của TikTok vào OBS, rồi bấm Start Streaming.</li>
+            <li>Bấm Kết nối ở trên, và ở lại theo dõi phòng live khi đang phát.</li>
+          </ol>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Âm thanh và nhân vật AI</h2>
+            <button id="livePreviewAudio" class="sm">🔇 Nghe thử</button>
+          </div>
+          <div class="live-settings">
+            <label><input type="checkbox" id="liveMusicOn"> Nhạc nền</label>
+            <label>Nhóm nhạc <select id="liveMusicGroup"></select></label>
+            <label>Âm lượng nhạc <input type="range" id="liveMusicVol" min="0" max="1" step="0.05"></label>
+            <label><input type="checkbox" id="liveSfxOn"> Âm thanh hiệu ứng</label>
+            <label>Âm lượng hiệu ứng <input type="range" id="liveSfxVol" min="0" max="1" step="0.05"></label>
+            <label><input type="checkbox" id="liveHostOn"> Hiện nhân vật AI</label>
+          </div>
+          <p id="liveHostInfo" class="muted small"></p>
+        </div>
+        <div class="panel" id="liveSim">
+          <div class="panel-head">
+            <h2>Thử offline</h2>
+            <button id="liveExitTest" class="sm hidden">Thoát chế độ thử</button>
+          </div>
+          <p class="muted small">Chỉ để kiểm tra khi chưa kết nối. Bản thử không được lưu, sân khấu luôn hiện nhãn "CHẾ ĐỘ THỬ", và các nút bị khóa khi đang live.</p>
+          <div class="live-sim-btns">
+            <button data-sim="like">💖 50 tim</button>
+            <button data-sim="gift">🌹 Quà 5 💎</button>
+            <button data-sim="biggift">🎁 Quà 200 💎</button>
+            <button data-sim="follow">➕ Follow</button>
+            <button data-sim="share">🔗 Chia sẻ</button>
+            <button data-sim="rain">🌧 Mưa</button>
+            <button data-sim="snow">❄️ Tuyết</button>
+            <button data-sim="sun">☀️ Nắng</button>
+            <button data-sim="night">🌙 Đêm</button>
+            <button data-sim="jump">🦘 Nhảy</button>
+            <button data-sim="eat">🍎 Ăn</button>
+          </div>
+          <p class="muted small">Đổi thời tiết bị giới hạn 15 giây một lần, giống khi live thật.</p>
+        </div>
+        <button id="liveReset" class="danger">Đặt lại thế giới</button>
+      </div>
+      <iframe class="live-preview" id="liveStage" src="stage.html?preview" title="Xem trước sân khấu"></iframe>
+    </div>
+  </section>
+
   <!-- ─────────────── CRAWL ─────────────── -->
   <section id="tab-crawl" class="tab active">
     <div class="crawl-grid">
     <div class="panel crawl-panel">
-      <h2>Từ khóa</h2>
-      <label class="field">
-        <span>Mỗi dòng một từ khóa, dùng <code>#</code> cho hashtag</span>
-        <textarea id="customKeywords" rows="6" placeholder="chuyện công sở&#10;#tamsu&#10;người yêu cũ"></textarea>
-      </label>
-      <div id="recentQueries" class="chips small"></div>
-
       <h2>Link bài</h2>
       <label class="field">
         <span>Mỗi dòng một link — chỉ crawl đúng bài đó (kèm bình luận)</span>
-        <textarea id="crawlUrls" rows="3" placeholder="https://www.threads.com/@ten_user/post/DRqu9lIk_pT"></textarea>
+        <textarea id="crawlUrls" rows="6" placeholder="https://www.threads.com/@ten_user/post/DRqu9lIk_pT"></textarea>
       </label>
 
       <h2>Tài khoản</h2>
@@ -47,12 +270,17 @@
 
       <h3>Tùy chọn</h3>
       <div class="opts">
-        <label class="field"><span>Số bài / từ khóa, tài khoản</span><input id="optLimit" type="number" value="20" min="1" max="200"></label>
-        <label class="field"><span>Bình luận / bài</span><input id="optReplies" type="number" value="15" min="0" max="100"></label>
+        <label class="field"><span>Số bài / tài khoản</span><input id="optLimit" type="number" value="20" min="1" max="200"></label>
+        <label class="field" title="Số bình luận trả lời thẳng vào bài, theo thứ tự nổi bật trên Threads"><span>Bình luận gốc / bài</span><input id="optReplies" type="number" value="10" min="0" max="100"></label>
+        <label class="field" title="Mỗi bình luận giữ tối đa N câu trả lời; mỗi câu trả lời lại giữ tối đa N câu trả lời của nó... tới tận cùng"><span>Nhánh / bình luận</span><input id="optBranches" type="number" value="3" min="1" max="20"></label>
+        <label class="field" title="Nhánh nào Threads ẩn thì mở trang riêng của bình luận để lấy cho tới tận cùng (~5 giây mỗi trang). Đây là giới hạn an toàn số trang mở thêm cho một bài; 0 = chỉ lấy nhánh hiện sẵn."><span>Tối đa trang mở nhánh / bài</span><input id="optExpandPages" type="number" value="60" min="0" max="500"></label>
+        <label class="field"><span>Bài đăng trong N ngày (0 = mọi lúc)</span><input id="optMaxAge" type="number" value="14" min="0"></label>
         <label class="field"><span>Ít nhất N likes</span><input id="optMinLikes" type="number" value="0" min="0"></label>
+        <label class="field"><span>Ít nhất N bình luận</span><input id="optMinReplies" type="number" value="3" min="0"></label>
       </div>
+      <p class="muted small">Bài đạt điều kiện được xếp theo độ hot (tương tác / tuổi bài), giữ N bài hot nhất mỗi tài khoản. Link bài dán vào luôn được lấy, không bị lọc.</p>
       <div class="checks">
-        <label><input type="checkbox" id="optRecent"> Mới nhất (thay vì nổi bật)</label>
+        <label title="Bỏ bài dưới 40 ký tự không kèm ảnh/video, và bài bán hàng / tuyển dụng"><input type="checkbox" id="optClean" checked> Lọc bài rác (quá ngắn, quảng cáo)</label>
         <label><input type="checkbox" id="optMedia" checked> Tải ảnh/video</label>
         <label><input type="checkbox" id="optShow"> Hiện trình duyệt</label>
       </div>
@@ -62,17 +290,22 @@
       </div>
     </div>
 
-      <div class="panel suggest-panel">
+      <div>
+      <div class="panel sources-panel">
         <div class="panel-head">
-          <h2>Gợi ý từ khóa</h2>
-          <span class="muted small">Bấm để thêm/bớt vào danh sách</span>
+          <h2>Tài khoản nguồn</h2>
+          <button class="ghost sm" id="addAllSources">+ Thêm tất cả vào crawl</button>
         </div>
-        <div id="suggestTabs" class="suggest-tabs"></div>
-        <div id="suggestBody" class="chips"></div>
-        <h3>Hashtag hay gặp trong bài đã crawl</h3>
-        <div id="suggestData" class="chips small"></div>
-        <h3>Từ khóa đã crawl — hiệu quả</h3>
-        <div id="suggestPerf"></div>
+        <p class="muted small">Tài khoản chuyên đăng chuyện công sở / hài, crawl đều đặn để có bài mới. Bấm tên để thêm vào ô Tài khoản.
+          Bài đã có trong kho chỉ được cập nhật số like, không tải lại.</p>
+        <div class="source-add">
+          <input id="sourceInput" placeholder="@ten_user hoặc link trang cá nhân">
+          <button id="sourceAdd">Thêm nguồn</button>
+        </div>
+        <div id="sourceList"></div>
+        <h3>Gợi ý từ bài đã crawl</h3>
+        <div id="sourceSuggest" class="chips small"></div>
+      </div>
       </div>
     </div>
   </section>
@@ -80,9 +313,10 @@
   <!-- ─────────────── KHO BÀI ─────────────── -->
   <section id="tab-library" class="tab">
     <div class="filters panel">
-      <select id="fQuery"><option value="">Tất cả từ khóa</option></select>
+      <select id="fQuery"><option value="">Tất cả nguồn</option></select>
       <input id="fSearch" placeholder="Tìm nội dung / tác giả...">
       <select id="fSort">
+        <option value="hot">🔥 Đang hot</option>
         <option value="likes">Nhiều like nhất</option>
         <option value="replies">Nhiều bình luận</option>
         <option value="newest">Mới đăng</option>
@@ -90,6 +324,7 @@
       </select>
       <button id="fStarred" class="ghost star-filter" title="Chỉ hiện bài đã gắn sao">☆ Yêu thích</button>
       <span id="postsCount" class="muted"></span>
+      <button id="clearPosts" class="danger" title="Xóa toàn bộ kho bài để crawl lại (giữ bài yêu thích)">🗑 Xóa tất cả</button>
     </div>
     <div id="postsGrid" class="posts-grid"></div>
     <div class="center"><button id="loadMore" class="ghost hidden">Tải thêm</button></div>
@@ -179,19 +414,26 @@
           <div class="seg-toggle" id="libTabs">
             <button data-lib="memes">😹 Thư viện meme</button>
             <button data-lib="sfx">🔊 Hiệu ứng âm thanh (SFX)</button>
+            <button data-lib="music">🎵 Nhạc nền</button>
           </div>
           <span class="lib-ctl" data-pane="memes">
             <select id="memeCat" class="sm" title="Lọc meme theo nhóm"></select>
             <input id="memeSearch" class="sm" placeholder="Tìm theo tên...">
+            <label class="upload-btn sm" title="Chỉ dùng video bạn tự quay hoặc đã được cho phép">🎞 Thêm video của tôi<input id="clipUpload" type="file" accept="video/*,.gif" hidden></label>
           </span>
           <span class="lib-ctl hidden" data-pane="sfx">
             <select id="sfxCat" class="sm" title="Lọc sfx theo tình huống"></select>
             <input id="sfxSearch" class="sm" placeholder="Tìm sfx...">
           </span>
+          <span class="lib-ctl hidden" data-pane="music">
+            <select id="musicCat" class="sm" title="Lọc nhạc theo nhóm"></select>
+            <input id="musicSearch" class="sm" placeholder="Tìm nhạc...">
+          </span>
           <span id="memeHint" class="muted small grow"></span>
         </div>
         <div id="memeLib" class="meme-lib"></div>
         <div id="sfxLib" class="sfx-lib hidden"></div>
+        <div id="musicLib" class="sfx-lib music-lib hidden"></div>
       </section>
     </div>
   </section>
@@ -231,5 +473,9 @@
 
 <script src="app.js"></script>
 <script src="editor.js"></script>
+<script src="live.js"></script>
+<script src="product.js"></script>
+<script src="shopee_reviews.js"></script>
+<script src="review_studio.js"></script>
 </body>
 </html>

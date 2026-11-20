@@ -7,7 +7,7 @@
 
 const Editor = (() => {
   const W = 1080, H = 1920;
-  const LEAD_IN = 0.35, TAIL = 0.9, SILENT = 2.5;
+  const LEAD_IN = 0.35, TAIL = 0.9, SILENT = 2.5; // SILENT: mặc định cho thẻ không có lời đọc
   const TEXT_TOP = 150, CARD_TOP = 300, SAFE_BOTTOM = 300;
   const CHARS_PER_SEC = 16; // ước tính khi chưa có giọng đọc thật
   // Watermark nảy khắp khung hình (khớp WATERMARK_TEXT / WATERMARK_SPEED trong video.py).
@@ -24,14 +24,19 @@ const Editor = (() => {
   let t = 0, playing = false, t0 = 0, wall0 = 0;
   let renderJobId = null;
 
-  const defaults = () => Object.assign(
-    { voice: "Hải Đăng", precision: "fp32", speed: 1.1, gap: 0.35, theme: "dark", musicCat: "funny", musicVolume: 0.15 },
-    store.get("editorDefaults", {}),
-  );
+  const defaults = () => {
+    const saved = store.get("editorDefaults", {});
+    if (!saved.musicV2) delete saved.musicVolume; // mức cũ (15%) bị giọng đọc lấn mất, gần như không nghe thấy nhạc
+    return Object.assign(
+      { voice: "Hải Đăng", precision: "fp32", speed: 1.1, gap: 0.35, silent: SILENT, theme: "dark", musicCat: "funny", musicVolume: 0.4 },
+      saved,
+    );
+  };
   const saveDefaults = () => store.set("editorDefaults", {
-    ...defaults(), voice: P.voice, precision: P.precision, speed: P.speed, gap: P.gap, theme: P.theme,
+    ...defaults(), musicV2: true, voice: P.voice, precision: P.precision, speed: P.speed, gap: P.gap, silent: segSilentDefault(), theme: P.theme,
     musicVolume: P.music[0]?.volume ?? defaults().musicVolume,
-    musicCat: P.music.length ? musicInfo(P.music[0].path)?.category ?? defaults().musicCat : "",
+    // Dự án chưa/không có nhạc thì giữ nhóm nhạc cũ, kẻo chỉnh tốc độ / kiểu thẻ lại làm các video sau mất nhạc nền.
+    musicCat: (P.music.length && musicInfo(P.music[0].path)?.category) || defaults().musicCat,
   });
 
   const uid = () => Math.random().toString(16).slice(2, 10);
@@ -62,12 +67,14 @@ const Editor = (() => {
     return hasAudio(s) ? s.audio.duration : Math.max(1, s.read_text.trim().length / CHARS_PER_SEC);
   }
 
+  const segSilentDefault = () => P?.silent ?? SILENT;
+
   function computeTimeline() {
     const seg = {};
     let tt = LEAD_IN;
     for (const s of P.segments) {
       const vd = voiceDur(s);
-      const voice = vd ? vd / P.speed : SILENT;
+      const voice = vd ? vd / P.speed : (s.silent || segSilentDefault());
       const len = voice + (s.hold || 0);
       seg[s.id] = { start: tt, end: tt + len, voice: vd ? voice : 0, est: vd != null && !hasAudio(s) };
       tt += len + P.gap;
@@ -120,13 +127,19 @@ const Editor = (() => {
     const d = defaults();
     return {
       id: Date.now().toString(36) + uid(), name: "", post_codes: [], posts: {}, segments: [], texts: [], memes: [], sfx: [], music: [], background: null,
-      voice: d.voice, precision: d.precision, speed: d.speed, gap: d.gap, theme: d.theme,
+      voice: d.voice, precision: d.precision, speed: d.speed, gap: d.gap, silent: d.silent, theme: d.theme,
     };
   }
 
   async function fetchPost(code) {
     if (!postCache[code]) postCache[code] = await api(`/api/posts/${code}`);
     return postCache[code];
+  }
+
+  // Bài có thể vừa được crawl lại (thêm bình luận, đổi thứ tự): bỏ bản lưu tạm để lần vẽ sau lấy bản mới.
+  function refreshPosts() {
+    for (const code of Object.keys(postCache)) delete postCache[code];
+    if (P && $("#tab-create").classList.contains("active")) renderPosts();
   }
 
   async function buildSegments(items) {
@@ -137,7 +150,7 @@ const Editor = (() => {
     });
   }
 
-  const authorReplies = (p) => p.replies.filter((r) => r.username === p.username).map((r) => r.code);
+  const authorReplies = (p) => p.replies.filter((r) => isSelfThread(r, p)).map((r) => r.code);
 
   function pickBackground(keepFile = false) {
     const list = state.materials.backgrounds;
@@ -149,8 +162,8 @@ const Editor = (() => {
 
   function defaultMusic() {
     const d = defaults();
-    if (!d.musicCat) return;
-    const list = state.materials.music.filter((m) => m.category === d.musicCat);
+    const cat = d.musicCat || "funny"; // bản cũ có thể đã lưu nhóm rỗng -> vẫn chọn nhạc
+    const list = state.materials.music.filter((m) => m.category === cat);
     const file = list.length ? pick(list) : state.materials.music[0];
     if (file) P.music = [{ id: uid(), path: file.path, start: 0, end: null, volume: d.musicVolume }];
   }
@@ -461,6 +474,27 @@ const Editor = (() => {
     return { x: (W - w) / 2 + (s.dx || 0), y: CARD_TOP + (band - h) / 2 + (s.dy || 0), w, h };
   }
 
+  const NO_CROP = [0, 0, 0, 0];
+  const isCropped = (s) => (s.crop || NO_CROP).some((v) => v > 0);
+
+  /** Phần thẻ còn lại sau khi cắt (khớp placed_card trong video.py): crop = [trái, trên, phải, dưới] theo tỉ lệ. */
+  function cropRect(s, r) {
+    const [l, t, rr, b] = s.crop || NO_CROP;
+    return { x: r.x + r.w * l, y: r.y + r.h * t, w: r.w * (1 - l - rr), h: r.h * (1 - t - b) };
+  }
+
+  /** Đổi cỡ thẻ mà phần đang hiện (đã cắt) vẫn đứng yên tâm, không trôi đi vì phần bị cắt lệch một bên. */
+  function setScale(seg, k, nw, nh) {
+    const [l, t, r, b] = seg.crop || NO_CROP;
+    const ox = ((l - r) / 2) * nw, oy = ((t - b) / 2) * nh; // tâm phần cắt lệch khỏi tâm thẻ (px ảnh gốc)
+    const old = seg.scale ?? 1;
+    seg.scale = k;
+    if (ox || oy) {
+      seg.dx = Math.round((seg.dx || 0) - (k - old) * ox);
+      seg.dy = Math.round((seg.dy || 0) - (k - old) * oy);
+    }
+  }
+
   function textImg(text) {
     let c = textImgs.get(text);
     if (!c) {
@@ -522,9 +556,17 @@ const Editor = (() => {
     stageCard = null;
     const img = cur && cardImg(cur);
     if (img) {
-      const r = cardRect(cur, img);
-      ctx.drawImage(img, r.x, r.y, r.w, r.h);
-      stageCard = { id: cur.id, ...r };
+      const full = cardRect(cur, img);
+      const r = cropRect(cur, full);
+      const [l, t] = cur.crop || NO_CROP;
+      const nw = img.naturalWidth, nh = img.naturalHeight;
+      if (cropping === cur.id) { // đang cắt: hiện mờ cả thẻ để thấy phần bị bỏ đi
+        ctx.globalAlpha = 0.3;
+        ctx.drawImage(img, full.x, full.y, full.w, full.h);
+        ctx.globalAlpha = 1;
+      }
+      if (r.w >= 1 && r.h >= 1) ctx.drawImage(img, l * nw, t * nh, (r.w / full.w) * nw, (r.h / full.h) * nh, r.x, r.y, r.w, r.h);
+      stageCard = { id: cur.id, ...r, full, nw, nh };
     }
 
     for (const m of P.memes) {
@@ -563,23 +605,79 @@ const Editor = (() => {
       ctx.drawImage(img, (W - img.naturalWidth) / 2, y);
     }
     drawWatermark(ctx);
-    if (stageCard && sel?.type === "seg" && sel.id === stageCard.id) drawCardFrame(ctx, stageCard);
+    if (stageCard && sel?.type === "seg" && sel.id === stageCard.id) drawCardFrame(ctx, stageCard, cropping === stageCard.id);
     $("#timeLabel").textContent = `${fmtT(t)} / ${fmtT(tl.total)}`;
   }
 
   const HANDLE = 34; // cạnh ô vuông kéo đổi cỡ ở góc thẻ (px khung 1080)
 
-  function drawCardFrame(ctx, r) {
-    ctx.strokeStyle = "#25f4ee";
+  function drawCardFrame(ctx, r, crop) {
+    const color = crop ? "#fe2c55" : "#25f4ee";
+    ctx.strokeStyle = color;
     ctx.lineWidth = 5;
-    ctx.setLineDash([18, 12]);
+    ctx.setLineDash(crop ? [] : [18, 12]);
     ctx.strokeRect(r.x, r.y, r.w, r.h);
     ctx.setLineDash([]);
-    ctx.fillStyle = "#25f4ee";
-    for (const [x, y] of corners(r)) ctx.fillRect(x - HANDLE / 2, y - HANDLE / 2, HANDLE, HANDLE);
+    ctx.fillStyle = color;
+    if (!crop) {
+      for (const [x, y] of corners(r)) ctx.fillRect(x - HANDLE / 2, y - HANDLE / 2, HANDLE, HANDLE);
+      return;
+    }
+    // chế độ cắt: thanh ở giữa mỗi cạnh + góc hình chữ L
+    const L = HANDLE * 1.6, T = 10;
+    ctx.fillRect(r.x + r.w / 2 - L / 2, r.y - T / 2, L, T);
+    ctx.fillRect(r.x + r.w / 2 - L / 2, r.y + r.h - T / 2, L, T);
+    ctx.fillRect(r.x - T / 2, r.y + r.h / 2 - L / 2, T, L);
+    ctx.fillRect(r.x + r.w - T / 2, r.y + r.h / 2 - L / 2, T, L);
+    for (const [x, y] of corners(r)) {
+      const sx = x === r.x ? 1 : -1, sy = y === r.y ? 1 : -1;
+      ctx.fillRect(x - T / 2, sy > 0 ? y - T / 2 : y - L + T / 2, T, L);
+      ctx.fillRect(sx > 0 ? x - T / 2 : x - L + T / 2, y - T / 2, L, T);
+    }
   }
 
   const corners = (r) => [[r.x, r.y], [r.x + r.w, r.y], [r.x, r.y + r.h], [r.x + r.w, r.y + r.h]];
+
+  // ── Cắt thẻ: kéo cạnh / góc của khung đỏ để bỏ bớt phần thẻ (vd thẻ phóng to quá màn hình) ──
+  let cropping = null; // id thẻ đang ở chế độ cắt
+
+  function setCropping(id) {
+    cropping = id;
+    renderInspector();
+    draw();
+  }
+
+  /** Cạnh đang trỏ vào trong chế độ cắt: {l, t, r, b} (true = cạnh đó đi theo chuột) hoặc null. */
+  function cropEdges(p, r) {
+    const near = (a, b) => Math.abs(a - b) < HANDLE;
+    const inX = p.x > r.x - HANDLE && p.x < r.x + r.w + HANDLE, inY = p.y > r.y - HANDLE && p.y < r.y + r.h + HANDLE;
+    const e = { l: inY && near(p.x, r.x), r: inY && near(p.x, r.x + r.w), t: inX && near(p.y, r.y), b: inX && near(p.y, r.y + r.h) };
+    if (e.l && e.r) e[Math.abs(p.x - r.x) < Math.abs(p.x - r.x - r.w) ? "r" : "l"] = false; // thẻ quá hẹp
+    if (e.t && e.b) e[Math.abs(p.y - r.y) < Math.abs(p.y - r.y - r.h) ? "b" : "t"] = false;
+    return e.l || e.r || e.t || e.b ? e : null;
+  }
+
+  const CROP_MIN = 0.05; // phần còn lại tối thiểu theo mỗi chiều
+
+  function dragCrop(seg, edges, p, full) {
+    const c = [...(seg.crop || NO_CROP)];
+    const fx = (p.x - full.x) / full.w, fy = (p.y - full.y) / full.h;
+    if (edges.l) c[0] = clamp(fx, 0, 1 - c[2] - CROP_MIN);
+    if (edges.r) c[2] = clamp(1 - fx, 0, 1 - c[0] - CROP_MIN);
+    if (edges.t) c[1] = clamp(fy, 0, 1 - c[3] - CROP_MIN);
+    if (edges.b) c[3] = clamp(1 - fy, 0, 1 - c[1] - CROP_MIN);
+    seg.crop = c.map((v) => Math.round(v * 1000) / 1000);
+  }
+
+  /** Cắt bỏ phần thẻ tràn ra ngoài khung hình 1080x1920. */
+  function cropToFrame(seg) {
+    const r = stageCard?.id === seg.id && stageCard.full;
+    if (!r) return toast("Hãy cho thẻ hiện trên khung hình trước");
+    const c = [Math.max(0, -r.x) / r.w, Math.max(0, -r.y) / r.h, Math.max(0, r.x + r.w - W) / r.w, Math.max(0, r.y + r.h - H) / r.h];
+    if (c[0] + c[2] > 1 - CROP_MIN || c[1] + c[3] > 1 - CROP_MIN) return toast("Thẻ gần như nằm ngoài khung, không cắt được");
+    if (!c.some((v) => v > 0)) return toast("Thẻ không tràn khung");
+    mutate(() => (seg.crop = c.map((v) => Math.round(v * 1000) / 1000)), { noTts: true });
+  }
 
   // ── Kéo thẻ trên khung hình: kéo thân = dời, kéo góc / lăn chuột = phóng to, thu nhỏ ──
   let stageCard = null; // thẻ đang hiện: {id, x, y, w, h}
@@ -594,7 +692,10 @@ const Editor = (() => {
   function stageHit(p) {
     const r = stageCard;
     if (!r) return null;
-    if (sel?.type === "seg" && sel.id === r.id && corners(r).some(([x, y]) => Math.abs(p.x - x) < HANDLE && Math.abs(p.y - y) < HANDLE)) return "resize";
+    if (cropping === r.id) {
+      const edges = cropEdges(p, r);
+      if (edges) return { crop: edges };
+    } else if (sel?.type === "seg" && sel.id === r.id && corners(r).some(([x, y]) => Math.abs(p.x - x) < HANDLE && Math.abs(p.y - y) < HANDLE)) return "resize";
     return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h ? "move" : null;
   }
 
@@ -608,7 +709,7 @@ const Editor = (() => {
     if (!(sel?.type === "seg" && sel.id === seg.id)) select("seg", seg.id);
     snapshot();
     const cx = stageCard.x + stageCard.w / 2, cy = stageCard.y + stageCard.h / 2;
-    stageDrag = { seg, mode, p0: p, dx: seg.dx || 0, dy: seg.dy || 0, scale: seg.scale ?? 1, cx, cy,
+    stageDrag = { seg, mode, p0: p, dx: seg.dx || 0, dy: seg.dy || 0, scale: seg.scale ?? 1, cx, cy, card: stageCard,
       dist: Math.max(20, Math.hypot(p.x - cx, p.y - cy)) };
     canvas().setPointerCapture(e.pointerId);
   }
@@ -617,7 +718,7 @@ const Editor = (() => {
     const p = stagePoint(e);
     if (!stageDrag) {
       const mode = stageHit(p);
-      canvas().style.cursor = mode === "resize" ? "nwse-resize" : mode ? "move" : "";
+      canvas().style.cursor = mode?.crop ? cropCursor(mode.crop) : mode === "resize" ? "nwse-resize" : mode ? "move" : "";
       return;
     }
     const d = stageDrag;
@@ -627,12 +728,20 @@ const Editor = (() => {
       if (Math.abs(dy) < SNAP) dy = 0;
       d.seg.dx = Math.round(dx);
       d.seg.dy = Math.round(dy);
+    } else if (d.mode.crop) {
+      dragCrop(d.seg, d.mode.crop, p, d.card.full);
     } else {
-      d.seg.scale = round2(clamp(d.scale * Math.hypot(p.x - d.cx, p.y - d.cy) / d.dist, 0.2, 5));
+      setScale(d.seg, round2(clamp(d.scale * Math.hypot(p.x - d.cx, p.y - d.cy) / d.dist, 0.2, 5)), d.card.nw, d.card.nh);
     }
     d.moved = true;
     draw();
     updateCardFields(d.seg);
+  }
+
+  function cropCursor(e) {
+    if ((e.l && e.t) || (e.r && e.b)) return "nwse-resize";
+    if ((e.r && e.t) || (e.l && e.b)) return "nesw-resize";
+    return e.l || e.r ? "ew-resize" : "ns-resize";
   }
 
   function onStageUp() {
@@ -652,7 +761,7 @@ const Editor = (() => {
       snapshot();
       if (!(sel?.type === "seg" && sel.id === seg.id)) select("seg", seg.id);
     }
-    seg.scale = round2(clamp((seg.scale ?? 1) * (e.deltaY < 0 ? 1.06 : 1 / 1.06), 0.2, 5));
+    setScale(seg, round2(clamp((seg.scale ?? 1) * (e.deltaY < 0 ? 1.06 : 1 / 1.06), 0.2, 5)), stageCard.nw, stageCard.nh);
     draw();
     updateCardFields(seg);
     clearTimeout(wheelTimer);
@@ -737,7 +846,7 @@ const Editor = (() => {
       live.add(mu.id);
       const span = tl.music[mu.id];
       const el = mediaEl(mu.id, "audio", fileUrl("music", mu.path));
-      el.volume = clamp(mu.volume * 2, 0, 1); // nhạc nền trong video được trộn nhỏ; nghe thử to hơn chút
+      el.volume = clamp(mu.volume, 0, 1); // đúng âm lượng khi xuất (server đã chuẩn hóa độ to bài nhạc)
       const dur = musicInfo(mu.path)?.duration || 1e9;
       syncEl(el, playing && t >= span.start && t < span.end, (t - span.start) % dur);
     }
@@ -847,7 +956,7 @@ const Editor = (() => {
       return `<div class="tl-item seg ${isSel("seg", s.id)} ${span.est ? "est" : ""}" data-type="seg" data-id="${s.id}"
           style="${box(span.start, span.end)};background:${color}" title="${esc(s.username)}: ${esc(s.display_text.slice(0, 200))}">
         ${holdW ? `<div class="hold" style="width:${holdW}px" title="Giữ thêm ${s.hold}s"></div>` : ""}
-        <span class="lbl">${i + 1}. ${icon} @${esc(s.username)}${s.page_label ? ` (${s.page_label})` : ""}${(s.scale ?? 1) !== 1 ? ` 🔍${Math.round(s.scale * 100)}%` : ""}${s.voice ? ` 🗣 ${esc(voiceLabel(s.voice))}` : ""}</span>
+        <span class="lbl">${i + 1}. ${icon} @${esc(s.username)}${s.page_label ? ` (${s.page_label})` : ""}${(s.scale ?? 1) !== 1 ? ` 🔍${Math.round(s.scale * 100)}%` : ""}${isCropped(s) ? " ✂" : ""}${s.voice ? ` 🗣 ${esc(voiceLabel(s.voice))}` : ""}</span>
         <span class="sub">${esc(s.display_text.replace(/\s+/g, " ").slice(0, 80))}</span>
         <div class="handle" title="Kéo để giữ thẻ lâu hơn"></div></div>`;
     }).join("") + endMark + '<div class="tl-insert hidden" id="tlInsert"></div>';
@@ -869,7 +978,7 @@ const Editor = (() => {
     row("music").innerHTML = P.music.map((mu) => {
       const s = tl.music[mu.id];
       return `<div class="tl-item music ${isSel("music", mu.id)}" data-type="music" data-id="${mu.id}" style="${box(s.start, s.end)}">
-        <span class="lbl">🎵 ${esc(mu.path.split("/").pop().replace(/\.\w+$/, ""))}</span><span class="sub">${Math.round(mu.volume * 100)}% · ${mu.end == null ? "đến hết" : (s.end - s.start).toFixed(1) + "s"}</span>
+        <span class="lbl">🎵 ${esc(musicInfo(mu.path) ? musicName(musicInfo(mu.path)) : mu.path.split("/").pop())}</span><span class="sub">${Math.round(mu.volume * 100)}% · ${mu.end == null ? "đến hết" : (s.end - s.start).toFixed(1) + "s"}</span>
         <div class="handle" title="Kéo để đổi độ dài"></div></div>`;
     }).join("") + endMark;
 
@@ -1014,6 +1123,7 @@ const Editor = (() => {
 
   function select(type, id) {
     sel = type ? { type, id } : null;
+    if (cropping && !(type === "seg" && id === cropping)) cropping = null;
     // chọn thẻ đang không hiện → nhảy tới thẻ đó để chỉnh trực tiếp trên khung hình
     const show = type === "seg" && tl?.shows[id];
     if (show && !playing && (t < show.start || t >= show.end)) seek(show.start + 0.05);
@@ -1061,7 +1171,7 @@ const Editor = (() => {
 
   function addMeme(path, time) {
     mutate(() => {
-      const m = { id: uid(), path, anchor: anchorAt(time), duration: null, position: "bottom-right", size: 0.4, volume: 1, chroma: null };
+      const m = { id: uid(), path, anchor: anchorAt(time), duration: null, position: "bottom-right", size: 0.4, volume: 0.6, chroma: null };
       P.memes.push(m);
       sel = { type: "meme", id: m.id };
     });
@@ -1075,7 +1185,7 @@ const Editor = (() => {
     mutate(() => {
       const span = tl.seg[seg.id];
       P.memes.push({ id: uid(), path, anchor: { seg: seg.id, offset: span.end - span.start }, duration: null,
-        position: "bottom-right", size: 0.4, volume: 1, chroma: null, holdSeg: seg.id });
+        position: "bottom-right", size: 0.4, volume: 0.6, chroma: null, holdSeg: seg.id });
       seg.hold = round1((seg.hold || 0) + len);
     });
     toast(`Đã chèn meme sau thẻ ${P.segments.indexOf(seg) + 1} (+${len.toFixed(1)}s)`);
@@ -1085,7 +1195,7 @@ const Editor = (() => {
   function insertSfx(path, time = null) {
     const seg = time == null && sel?.type === "seg" && findItem("seg", sel.id);
     const meme = time == null && sel?.type === "meme" && findItem("meme", sel.id);
-    const x = { id: uid(), path, anchor: null, duration: null, volume: 1 };
+    const x = { id: uid(), path, anchor: null, duration: null, volume: 0.6 };
     x.anchor = seg ? { seg: seg.id, offset: 0 } : meme ? { ...meme.anchor } : anchorAt(time ?? t);
     mutate(() => {
       P.sfx.push(x);
@@ -1115,13 +1225,12 @@ const Editor = (() => {
     $("#inspector textarea[data-f=text]")?.focus();
   }
 
-  function addMusic() {
+  function addMusic(path) {
     const list = state.materials.music;
     if (!list.length) return toast("Chưa có nhạc trong materials/background_musics", true);
-    const cat = defaults().musicCat;
-    const file = pick(list.filter((m) => m.category === cat).length ? list.filter((m) => m.category === cat) : list);
+    if (typeof path !== "string") return showLibTab("music"); // nút "+ Nhạc": mở thư viện để chọn bài
     mutate(() => {
-      const mu = { id: uid(), path: file.path, start: round1(t), end: null, volume: defaults().musicVolume };
+      const mu = { id: uid(), path, start: round1(t), end: null, volume: defaults().musicVolume };
       P.music.push(mu);
       sel = { type: "music", id: mu.id };
     });
@@ -1136,13 +1245,17 @@ const Editor = (() => {
     if (missing.length) {
       await Promise.all(missing.map((c) => fetchPost(c).catch(() => null)));
     }
+    // Vẽ lại cả cột mỗi lần chọn bình luận: giữ vị trí cuộn của cột và của từng danh sách bình luận,
+    // không thì cứ bấm chọn là bị kéo về đầu.
+    const panel = $(".ed-posts");
+    const panelTop = panel.scrollTop;
+    const listTops = Object.fromEntries($$("#edPosts [data-post]").map((el) => [el.dataset.post, $(".replies", el)?.scrollTop || 0]));
     $("#edPosts").innerHTML = P.post_codes.map((code, i) => {
       const p = postCache[code];
       if (!p) return "";
       const chosen = P.posts[code]?.replies || [];
       const open = openPost === code;
       const nSeg = P.segments.filter((s) => s.post_code === code).length;
-      const sorted = [...p.replies].sort((a, b) => (b.username === p.username) - (a.username === p.username) || b.like_count - a.like_count);
       return `<div class="ed-post" data-post="${esc(code)}">
         <div class="ed-post-head" data-act="toggle">
           <span class="dot" style="background:${POST_COLORS[i % POST_COLORS.length]}"></span>
@@ -1157,10 +1270,15 @@ const Editor = (() => {
             <button class="ghost sm" data-act="top3">+ Top 3 like</button>
             <button class="ghost sm" data-act="none">Bỏ hết</button>
           </div>
-          <div class="replies">${sorted.length ? sorted.map((r) => replyHtml(r, p, chosen.indexOf(r.code) + 1)).join("") : '<p class="muted small">Chưa có bình luận đã lưu.</p>'}</div>
+          <div class="replies">${p.replies.length ? p.replies.map((r) => replyHtml(r, p, chosen.indexOf(r.code) + 1)).join("") : '<p class="muted small">Chưa có bình luận đã lưu.</p>'}</div>
         </div>` : ""}
       </div>`;
     }).join("");
+    $$("#edPosts [data-post]").forEach((el) => {
+      const list = $(".replies", el);
+      if (list) list.scrollTop = listTops[el.dataset.post] || 0;
+    });
+    panel.scrollTop = panelTop;
   }
 
   async function onPostsClick(e) {
@@ -1194,7 +1312,7 @@ const Editor = (() => {
     if (act === "top3") {
       const p = postCache[code];
       const chosen = P.posts[code].replies;
-      const add = p.replies.filter((r) => r.username !== p.username && !chosen.includes(r.code))
+      const add = p.replies.filter((r) => !isSelfThread(r, p) && !r.depth && !chosen.includes(r.code))
         .sort((a, b) => b.like_count - a.like_count).slice(0, 3);
       for (const r of add) await toggleReply(code, r.code);
     }
@@ -1217,10 +1335,16 @@ const Editor = (() => {
     }
     try {
       const segs = (await buildSegments([{ code: postCode, reply_codes: [replyCode] }])).filter((s) => s.code === replyCode);
+      // Chèn theo thứ tự hội thoại trên Threads (không theo thứ tự bấm): sau thẻ cuối cùng của bài
+      // hoặc của bình luận đứng trước nó.
+      const order = postCache[postCode].replies.map((r) => r.code);
+      const before = new Set([postCode, ...order.slice(0, order.indexOf(replyCode))]);
       mutate(() => {
         P.posts[postCode].replies.push(replyCode);
+        P.posts[postCode].replies.sort((a, b) => order.indexOf(a) - order.indexOf(b));
         let idx = -1;
-        P.segments.forEach((s, i) => { if (s.post_code === postCode) idx = i; });
+        P.segments.forEach((s, i) => { if (s.post_code === postCode && before.has(s.code)) idx = i; });
+        if (idx < 0) P.segments.forEach((s, i) => { if (s.post_code === postCode) idx = i; });
         P.segments.splice(idx + 1, 0, ...segs);
       }, { posts: true });
     } catch (e) { toast(e.message, true); }
@@ -1247,6 +1371,7 @@ const Editor = (() => {
 
   function renderInspector() {
     updateMemeHint();
+    renderMusicLib(); // cập nhật "✓ đang dùng" và nút Dùng theo mục đang chọn
     const el = $("#inspector");
     if (!P) return (el.innerHTML = "");
     const it = sel && findItem(sel.type, sel.id);
@@ -1273,6 +1398,7 @@ const Editor = (() => {
             <option value="int8" ${P.precision === "int8" ? "selected" : ""}>Nhanh (int8)</option></select></label>
         </div>
         <label class="field"><span>Nghỉ giữa các thẻ <b>${P.gap.toFixed(2)}s</b></span><input type="range" data-f="gap" min="0" max="2" step="0.05" value="${P.gap}"></label>
+        <label class="field"><span>Thẻ không có lời đọc hiện <b>${segSilentDefault().toFixed(1)}s</b></span><input type="range" data-f="silent" min="0.5" max="10" step="0.1" value="${segSilentDefault()}"></label>
         <label class="field"><span>Kiểu thẻ</span></label>
         <div class="seg-toggle">${["dark", "light"].map((v) => `<button data-theme="${v}" class="${P.theme === v ? "active" : ""}">${v === "light" ? "Sáng" : "Tối (như Threads)"}</button>`).join("")}</div>
         <h3>Phím tắt</h3>
@@ -1284,10 +1410,11 @@ const Editor = (() => {
         <p class="hint">${it.kind === "post" ? "Bài viết" : it.reply_to ? "Bình luận → @" + esc(it.reply_to) : "Tác giả viết tiếp"} · ${fmtT(span.start)} → ${fmtT(span.end)}
           ${hasAudio(it) ? "· 🔊 " + it.audio.duration.toFixed(1) + "s" : it.read_text.trim() ? "· ≈ đang chờ giọng đọc" : "· 🔇 không đọc"}</p>
         <label class="field"><span>Chữ trên thẻ</span><textarea rows="6" data-f="display_text">${esc(it.display_text)}</textarea></label>
-        <label class="field"><span>Lời đọc <em>(để trống = thẻ im lặng ${SILENT}s)</em></span><textarea rows="4" data-f="read_text">${esc(it.read_text)}</textarea></label>
+        <label class="field"><span>Lời đọc <em>(để trống = thẻ im lặng)</em></span><textarea rows="4" data-f="read_text">${esc(it.read_text)}</textarea></label>
         <label class="field"><span>Giọng đọc thẻ này</span>
           <select data-f="segVoice"><option value="">Giọng chung của video (${esc(voiceLabel(P.voice))})</option>
             ${state.voices.map((v) => `<option value="${esc(v.id)}" ${v.id === it.voice ? "selected" : ""}>${esc(v.label)}</option>`).join("")}</select></label>
+        <label class="field"><span>Thẻ im lặng hiện bao lâu (giây) <em>(khi lời đọc trống; bỏ trống = theo cài đặt chung ${segSilentDefault().toFixed(1)}s)</em></span><input type="number" data-f="silent" min="0.1" max="60" step="0.1" placeholder="${segSilentDefault().toFixed(1)}" value="${it.silent ?? ""}"></label>
         <label class="field"><span>Giữ thẻ thêm (giây) sau khi đọc xong</span><input type="number" data-f="hold" min="0" step="0.5" value="${it.hold || 0}"></label>
         <label class="field"><span>🔍 Cỡ thẻ <b>${Math.round((it.scale ?? 1) * 100)}%</b></span>
           <input type="range" data-f="scale" min="0.2" max="4" step="0.05" value="${it.scale ?? 1}"></label>
@@ -1297,6 +1424,12 @@ const Editor = (() => {
           <label class="field"><span>Dời dọc (px)</span><input type="number" data-f="dy" step="10" value="${it.dy || 0}"></label>
         </div>
         <button class="ghost sm" data-cmd="centerCard">⌖ Về giữa, cỡ 100%</button>
+        <div class="row gap wrap">
+          <button class="${cropping === it.id ? "" : "ghost "}sm" data-cmd="cropMode">${cropping === it.id ? "✓ Xong cắt" : "✂ Cắt thẻ"}</button>
+          <button class="ghost sm" data-cmd="cropFrame" title="Bỏ phần thẻ tràn ra ngoài màn hình">▣ Cắt vừa khung hình</button>
+          ${isCropped(it) ? '<button class="ghost sm" data-cmd="cropReset">↺ Bỏ cắt</button>' : ""}
+        </div>
+        ${cropping === it.id ? '<p class="hint">Kéo cạnh / góc khung đỏ để cắt bớt thẻ, phần mờ là phần bị bỏ. Kéo bên trong để dời thẻ. Esc hoặc "Xong cắt" để thoát.</p>' : ""}
         <p class="hint">Trên khung hình: kéo thẻ để dời (gần giữa sẽ tự hít vào), kéo ô vuông ở góc hoặc lăn chuột trên thẻ để phóng to / thu nhỏ. Thẻ được phép tràn ra ngoài khung. Mẹo nhấn mạnh: nhân bản thẻ, sửa chữ chỉ còn câu cần nhấn rồi phóng to bản sao.</p>
         <div class="row gap wrap">
           <button class="ghost sm" data-cmd="duplicate" title="Ctrl+D">⧉ Nhân bản thẻ</button>
@@ -1347,12 +1480,16 @@ const Editor = (() => {
       const cats = [...new Set(state.materials.music.map((m) => m.category))];
       html = head("Nhạc nền") + `
         <label class="field"><span>Bài nhạc</span><select data-f="path">${cats.map((c) => `<optgroup label="${esc(c || "chung")}">${state.materials.music.filter((m) => m.category === c).map((m) =>
-          `<option value="${esc(m.path)}" ${m.path === it.path ? "selected" : ""}>${esc(m.name)} (${fmtDur(m.duration)})</option>`).join("")}</optgroup>`).join("")}</select></label>
+          `<option value="${esc(m.path)}" ${m.path === it.path ? "selected" : ""}>${esc(musicName(m))} (${fmtDur(m.duration)})</option>`).join("")}</optgroup>`).join("")}</select></label>
         <div class="two">
           <label class="field"><span>Bắt đầu (giây)</span><input type="number" data-f="mstart" min="0" step="0.5" value="${it.start}"></label>
           <label class="field"><span>Kết thúc (trống = hết video)</span><input type="number" data-f="end" min="0" step="0.5" value="${it.end ?? ""}"></label>
         </div>
-        <label class="field"><span>Âm lượng <b>${Math.round(it.volume * 100)}%</b></span><input type="range" data-f="volume" min="0" max="0.6" step="0.01" value="${it.volume}"></label>
+        <div class="row gap wrap">
+          <button class="ghost sm" data-cmd="musicPreview">▶ Nghe thử bài này</button>
+          <button class="ghost sm" data-cmd="musicLib">🎵 Chọn trong thư viện nhạc</button>
+        </div>
+        <label class="field"><span>Âm lượng <b>${Math.round(it.volume * 100)}%</b></span><input type="range" data-f="volume" min="0" max="1" step="0.01" value="${it.volume}"></label>
         <p class="hint">Nhạc ngắn hơn đoạn sẽ tự lặp lại. Thêm nhiều đoạn nhạc bằng nút "+ Nhạc".</p>`;
     } else if (sel.type === "bg") {
       html = head("Video nền", false) + `
@@ -1378,10 +1515,12 @@ const Editor = (() => {
       if (!sel) {
         if (f === "publish_at") P.publish_at = raw || null;
         else if (f === "voice" || f === "precision") P[f] = raw;
+        else if (f === "silent") P.silent = clamp(num || SILENT, 0.1, 60);
         else P[f] = num ?? P[f];
         saveDefaults();
       } else if (sel.type === "seg") {
         if (f === "hold") it.hold = Math.max(0, num || 0);
+        else if (f === "silent") it.silent = num && num > 0 ? clamp(num, 0.1, 60) : null;
         else if (f === "scale") it.scale = clamp(num || 1, 0.2, 5);
         else if (f === "dx" || f === "dy") it[f] = clamp(Math.round(num || 0), -3000, 3000);
         else if (f === "segVoice") it.voice = raw || null;
@@ -1416,7 +1555,7 @@ const Editor = (() => {
     // Ô nhập liệu: không vẽ lại bảng (giữ con trỏ); nhãn <b> cạnh thanh trượt cập nhật tại chỗ.
     const b = e.target.closest("label")?.querySelector("b");
     if (b && e.target.type === "range") {
-      b.textContent = f === "speed" ? `${(+raw).toFixed(2)}x` : f === "gap" ? `${(+raw).toFixed(2)}s` : `${Math.round(raw * 100)}%`;
+      b.textContent = f === "speed" ? `${(+raw).toFixed(2)}x` : f === "gap" ? `${(+raw).toFixed(2)}s` : f === "silent" ? `${(+raw).toFixed(1)}s` : `${Math.round(raw * 100)}%`;
     }
     changed({ keepInspector: live && e.type === "input" });
   }
@@ -1435,11 +1574,16 @@ const Editor = (() => {
     if (cmd === "rerollBg") return mutate(() => pickBackground(true));
     if (cmd === "duplicate") return duplicateSeg(it.id);
     if (cmd === "sfxPreview") return previewSfx(it.path);
+    if (cmd === "musicPreview") return previewAudio("music", it.path);
+    if (cmd === "musicLib") return showLibTab("music");
     const at = t_.closest("[data-sfxat]")?.dataset.sfxat;
     if (at && it) {
       const span = tl.seg[it.anchor.seg];
       return mutate(() => (it.anchor.offset = round1({ head: 0, voice: span.voice, end: span.end - span.start }[at])));
     }
+    if (cmd === "cropMode") return setCropping(cropping === it.id ? null : it.id);
+    if (cmd === "cropFrame") return cropToFrame(it);
+    if (cmd === "cropReset") return mutate(() => (it.crop = [...NO_CROP]), { noTts: true });
     if (cmd === "centerCard") return mutate(() => Object.assign(it, { scale: 1, dx: 0, dy: 0 }), { noTts: true });
     const scale = t_.closest("[data-scale]")?.dataset.scale;
     if (scale && it) return mutate(() => (it.scale = +scale));
@@ -1482,16 +1626,56 @@ const Editor = (() => {
 
   // ───────────────────────── Xuất video ─────────────────────────
 
+  /** Hộp thoại nhiều lựa chọn; trả về `value` của nút được bấm, hoặc null khi đóng (Esc, ✕, bấm ra ngoài). */
+  function askChoice(title, text, choices) {
+    return new Promise((resolve) => {
+      const wrap = document.createElement("div");
+      wrap.className = "modal";
+      wrap.innerHTML = `<div class="modal-body choice-body">
+        <button class="drawer-close" data-v="">✕</button>
+        <h3>${esc(title)}</h3>
+        ${text ? `<p class="muted">${esc(text)}</p>` : ""}
+        <div class="row gap wrap">${choices.map((c, i) => `<button class="${c.cls || "ghost"}" data-i="${i}">${esc(c.label)}</button>`).join("")}</div>
+      </div>`;
+      const done = (v) => {
+        document.removeEventListener("keydown", onKey, true);
+        wrap.remove();
+        resolve(v);
+      };
+      const onKey = (e) => {
+        if (e.key !== "Escape" && e.key !== "Enter") return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === "Escape") done(null);
+        else document.activeElement?.closest?.(".choice-body [data-i]")?.click();
+      };
+      wrap.addEventListener("click", (e) => {
+        if (e.target === wrap || e.target.closest("[data-v]")) return done(null);
+        const i = e.target.closest("[data-i]")?.dataset.i;
+        if (i != null) done(choices[+i].value);
+      });
+      document.addEventListener("keydown", onKey, true);
+      document.body.appendChild(wrap);
+      wrap.querySelector("[data-i]")?.focus();
+    });
+  }
+
   let renderMsg = "";
   async function startRender() {
     if (!P?.segments.length) return toast("Timeline chưa có thẻ nào", true);
     if (!P.background) return toast("Chưa có video nền trong materials/background_videos", true);
+    const keep = await askChoice("Xuất video", "Giữ lại bài viết trong Kho bài sau khi xuất?", [
+      { label: "📌 Giữ lại bài (vd. để làm phần 2)", value: true, cls: "primary" },
+      { label: "🗑 Xóa khỏi kho như bình thường", value: false },
+      { label: "Hủy, chưa xuất", value: null },
+    ]);
+    if (keep === null) return;
     try {
-      const job = await api("/api/render", { method: "POST", body: P });
+      const job = await api("/api/render", { method: "POST", body: { ...P, keep_posts: keep } });
       renderJobId = job.id;
       renderMsg = "🎬 Đang chờ xuất video...";
       updateTtsStatus();
-      toast("Đã bắt đầu xuất video. Xuất xong dự án sẽ tự đóng và xóa khỏi danh sách dở.");
+      toast(`Đã bắt đầu xuất video${keep ? ", bài viết được giữ lại trong kho" : ""}. Xuất xong dự án sẽ tự đóng và xóa khỏi danh sách dở.`);
       pollJobs();
     } catch (e) { toast(e.message, true); }
   }
@@ -1499,7 +1683,7 @@ const Editor = (() => {
   function onJobs(jobs) {
     const j = renderJobId && jobs.find((x) => x.id === renderJobId);
     if (!j) return;
-    if (j.status === "done" || j.status === "error") {
+    if (j.status === "done" || j.status === "error" || j.status === "cancelled") {
       renderJobId = null;
       renderMsg = "";
       if (j.status === "done" && j.result?.project_id && j.result.project_id === P?.id) {
@@ -1536,7 +1720,10 @@ const Editor = (() => {
   function updateMemeHint() {
     const seg = P && sel?.type === "seg" && findItem("seg", sel.id);
     const n = seg && P.segments.indexOf(seg) + 1;
-    $("#memeHint").textContent = libTab() === "sfx"
+    $("#memeHint").textContent = libTab() === "music"
+      ? sel?.type === "music" ? "Bấm ▶ để nghe thử · \"Dùng\" để thay nhạc của đoạn đang chọn"
+        : "Bấm ▶ để nghe thử · \"Dùng\" để đặt làm nhạc nền của video · ➕ thêm một đoạn nhạc tại đầu phát"
+      : libTab() === "sfx"
       ? seg ? `Bấm ➕ để chèn sfx vào đầu thẻ ${n}`
         : sel?.type === "meme" ? "Bấm ➕ để chèn sfx cùng lúc với meme đang chọn"
           : "Bấm sfx để nghe thử · ➕ chèn tại đầu phát · chọn thẻ trên timeline để chèn vào đầu thẻ đó · hoặc kéo vào hàng SFX"
@@ -1553,7 +1740,9 @@ const Editor = (() => {
     $$(".lib-ctl").forEach((el) => el.classList.toggle("hidden", el.dataset.pane !== tab));
     $("#memeLib").classList.toggle("hidden", tab !== "memes");
     $("#sfxLib").classList.toggle("hidden", tab !== "sfx");
-    if (tab !== "sfx") stopSfxPreview();
+    $("#musicLib").classList.toggle("hidden", tab !== "music");
+    stopSfxPreview();
+    if (tab === "music") renderMusicLib();
     updateMemeHint();
   }
 
@@ -1567,32 +1756,77 @@ const Editor = (() => {
     const q = $("#sfxSearch").value.trim().toLowerCase();
     const list = all.filter((m) => (!cur || m.category === cur) && (!q || sfxName(m.path).toLowerCase().includes(q)));
     $("#sfxLib").innerHTML = list.length ? list.map((m) => `
-      <div class="sfx-item ${sfxPlaying === m.path ? "playing" : ""}" draggable="true" data-sfx="${esc(m.path)}" title="Bấm để nghe thử · kéo vào hàng SFX">
-        <span class="play">${sfxPlaying === m.path ? "⏸" : "▶"}</span>
+      <div class="sfx-item ${sfxPlaying === "sfx:" + m.path ? "playing" : ""}" draggable="true" data-sfx="${esc(m.path)}" title="Bấm để nghe thử · kéo vào hàng SFX">
+        <span class="play">${sfxPlaying === "sfx:" + m.path ? "⏸" : "▶"}</span>
         <div class="meta"><b>${esc(sfxName(m.path))}</b><span>${esc(label(m.category))} · ${m.duration.toFixed(1)}s</span></div>
         <button class="ghost sm add" data-sact="add" title="Chèn vào video">➕</button></div>`).join("")
       : '<span class="muted small">Chưa có sfx. Chạy <code>uv run threads-crawler sfx</code> để tải về materials/sfx/</span>';
   }
 
+  // ── Thư viện nhạc nền ──
+  // Tên file kiểu pixabay: tacgia-ten-bai-123456 → "tacgia ten bai" (bỏ mã số cuối).
+  const musicName = (m) => m.name.replace(/[-_]\d{4,}$/, "").replace(/[-_]+/g, " ");
+
+  function renderMusicLib() {
+    if (libTab() !== "music") return;
+    const all = state.materials.music;
+    const cats = [...new Set(all.map((m) => m.category))].sort((a, b) => a.localeCompare(b, "vi"));
+    const label = (c) => (c || "chung").replaceAll("_", " ");
+    const cur = store.get("musicLibCat", "");
+    $("#musicCat").innerHTML = `<option value="">🎵 Tất cả nhạc (${all.length})</option>` +
+      cats.map((c) => `<option value="${esc(c)}" ${c === cur ? "selected" : ""}>${esc(label(c))} (${all.filter((m) => m.category === c).length})</option>`).join("");
+    const q = $("#musicSearch").value.trim().toLowerCase();
+    const list = all.filter((m) => (!cur || m.category === cur) && (!q || m.name.toLowerCase().includes(q)));
+    const used = new Set(P?.music.map((m) => m.path));
+    const target = P && sel?.type === "music" ? "Thay nhạc của đoạn đang chọn" : "Đặt làm nhạc nền của video";
+    $("#musicLib").innerHTML = list.length ? list.map((m) => `
+      <div class="sfx-item ${sfxPlaying === "music:" + m.path ? "playing" : ""} ${used.has(m.path) ? "used" : ""}" data-music="${esc(m.path)}" title="${esc(m.name)}">
+        <span class="play">${sfxPlaying === "music:" + m.path ? "⏸" : "▶"}</span>
+        <div class="meta"><b>${esc(musicName(m))}</b><span>${esc(label(m.category))} · ${fmtDur(m.duration)}${used.has(m.path) ? ' · <span class="used-tag">✓ đang dùng</span>' : ""}</span></div>
+        <button class="sm primary" data-mact="use" title="${target}">Dùng</button>
+        <button class="ghost sm add" data-mact="add" title="Thêm một đoạn nhạc này tại đầu phát">➕</button></div>`).join("")
+      : '<span class="muted small">Không có nhạc nào. Thêm file .mp3 vào materials/background_musics/&lt;nhóm&gt;/</span>';
+  }
+
+  // Đặt bài nhạc: thay đoạn nhạc đang chọn, không thì thay nhạc chính (đoạn đầu), chưa có thì tạo mới.
+  function useMusic(path) {
+    if (!P) return toast("Chưa có video đang làm", true);
+    mutate(() => {
+      let mu = (sel?.type === "music" && findItem("music", sel.id)) || P.music[0];
+      if (!mu) {
+        mu = { id: uid(), path, start: 0, end: null, volume: defaults().musicVolume };
+        P.music.push(mu);
+      }
+      mu.path = path;
+      sel = { type: "music", id: mu.id };
+    });
+    saveDefaults();
+    toast(`🎵 ${musicName(musicInfo(path))}`);
+  }
+
+  // Trình nghe thử dùng chung cho sfx và nhạc: sfxPlaying = "sfx:<path>" | "music:<path>".
   const sfxAudio = new Audio();
   let sfxPlaying = null;
-  sfxAudio.addEventListener("ended", () => { sfxPlaying = null; renderSfxLib(); });
+  sfxAudio.addEventListener("ended", () => { sfxPlaying = null; renderSfxLib(); renderMusicLib(); });
 
-  function previewSfx(path) {
+  function previewAudio(kind, path) {
     if (playing) pause();
-    if (sfxPlaying === path) return stopSfxPreview();
-    sfxAudio.src = fileUrl("sfx", path);
+    if (sfxPlaying === `${kind}:${path}`) return stopSfxPreview();
+    sfxAudio.src = fileUrl(kind, path);
     sfxAudio.currentTime = 0;
     sfxAudio.play().catch(() => {});
-    sfxPlaying = path;
+    sfxPlaying = `${kind}:${path}`;
     renderSfxLib();
+    renderMusicLib();
   }
+  const previewSfx = (path) => previewAudio("sfx", path);
 
   function stopSfxPreview() {
     sfxAudio.pause();
     if (sfxPlaying) {
       sfxPlaying = null;
       renderSfxLib();
+      renderMusicLib();
     }
   }
 
@@ -1702,6 +1936,19 @@ const Editor = (() => {
       renderSfxLib();
     };
     $("#sfxSearch").oninput = renderSfxLib;
+    $("#musicCat").onchange = () => {
+      store.set("musicLibCat", $("#musicCat").value);
+      renderMusicLib();
+    };
+    $("#musicSearch").oninput = renderMusicLib;
+    $("#musicLib").addEventListener("click", (e) => {
+      const m = e.target.closest("[data-music]");
+      if (!m) return;
+      const act = e.target.closest("[data-mact]")?.dataset.mact;
+      if (act === "use") return useMusic(m.dataset.music);
+      if (act === "add") return addMusic(m.dataset.music);
+      previewAudio("music", m.dataset.music);
+    });
     $("#sfxLib").addEventListener("dragstart", (e) => {
       const m = e.target.closest("[data-sfx]");
       if (m) e.dataTransfer.setData("text/sfx", m.dataset.sfx);
@@ -1766,7 +2013,9 @@ const Editor = (() => {
       }
       if (!P || !$("#tab-create").classList.contains("active")) return;
       if (e.target.closest("input, textarea, select")) return;
-      if (e.code === "Space") {
+      if (e.key === "Escape" && cropping) {
+        setCropping(null);
+      } else if (e.code === "Space") {
         e.preventDefault();
         playing ? pause() : play();
       } else if (e.key === "Delete" || e.key === "Backspace") {
@@ -1789,6 +2038,7 @@ const Editor = (() => {
   function onShow() {
     showEditor();
     if (!P) return;
+    for (const code of Object.keys(postCache)) delete postCache[code]; // luôn lấy bình luận mới nhất trong kho
     if (!P.background) pickBackground();
     tl = computeTimeline();
     renderPosts();
@@ -1802,7 +2052,7 @@ const Editor = (() => {
   }
 
   return {
-    init, onShow, onJobs, pause, createFromPosts, addPosts,
+    init, onShow, onJobs, pause, createFromPosts, addPosts, refreshPosts, renderMemeLib,
     hasProject: () => !!P,
     hasPost: (code) => !!P?.post_codes.includes(code),
   };

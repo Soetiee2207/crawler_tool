@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -16,15 +17,27 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import cards, keywords, media, tts, video
+from . import cards, keywords, live, media, product, review_video, shopee, shopee_reviews, tts, video
 from .crawler import DEFAULT_PROFILE_DIR
 from .jobs import JobManager
 from .pipeline import CrawlOptions, CrawlTarget, crawl, parse_post_url, parse_username
+from .quality import QualityFilter
 from .storage import Store
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 PACKAGE_DIR = Path(__file__).parent
+UPLOAD_CATEGORY = "video_của_tôi"
+MAX_UPLOAD_BYTES = 1024**3
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """Giao diện luôn được kiểm tra lại (ETag) để sửa code xong tải lại là thấy, không dính cache cũ."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
 
 
 def code_stamp() -> float:
@@ -37,9 +50,14 @@ class CrawlRequest(BaseModel):
     urls: list[str] = []  # link bài cụ thể
     users: list[str] = []  # tên tài khoản: crawl các bài của người đó
     limit: int = Field(20, ge=1, le=200)
-    replies: int = Field(10, ge=0, le=100)
+    replies: int = Field(10, ge=0, le=100)  # số mạch bình luận mỗi bài
+    branches: int = Field(3, ge=1, le=20)  # số câu trả lời giữ ở mỗi bình luận, mọi tầng
+    expand_pages: int = Field(60, ge=0, le=500)  # chặn số trang mở thêm mỗi bài để lấy nhánh bị ẩn
     min_likes: int = Field(0, ge=0)
-    recent: bool = False
+    min_replies: int = Field(3, ge=0)
+    max_age_days: int = Field(14, ge=0)  # 0 = không giới hạn
+    tabs: Literal["both", "top", "recent"] = "both"
+    clean: bool = True  # bỏ bài quá ngắn (không ảnh) và bài quảng cáo
     media: bool = True
     show_browser: bool = False
 
@@ -73,6 +91,47 @@ class TtsRequest(BaseModel):
 
 class StarRequest(BaseModel):
     starred: bool
+
+
+class SourceRequest(BaseModel):
+    username: str
+
+
+class ProductRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    intro: str = Field(min_length=1, max_length=3000)
+    price: str = Field("", max_length=60)
+    source: str = Field(min_length=1, max_length=30)  # đánh giá lấy từ đâu, hiện trên thẻ
+    reviews: str = Field(min_length=1, max_length=50000)
+    cta: str = Field("", max_length=300)
+    image: str | None = None  # data URL
+
+
+class ProductFetchRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class ShopeeReviewsRequest(BaseModel):
+    urls: list[str]
+    limit: int = Field(200, ge=1, le=5000)
+    download_videos: bool = False
+    refresh: bool = False
+    videos_only: bool = False
+    delay: float = Field(3, ge=1, le=60)  # không cho đặt dưới 1 giây để giữ nhịp truy cập
+    timeout: float = Field(45, ge=5, le=300)
+    retries: int = Field(2, ge=0, le=5)
+
+
+class IngestRequest(BaseModel):
+    page_url: str = Field(max_length=8000)
+    api_url: str = Field(max_length=8000)
+    body: str = Field(max_length=5_000_000)
+
+
+class MarkRequest(BaseModel):
+    picked: bool = False
+    claim: str = Field("", max_length=500)
+    permission: Literal["none", "asked", "granted", "denied"] = "none"
 
 
 class CardRequest(BaseModel):
@@ -113,8 +172,12 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
             raise HTTPException(400, "Không hiểu: " + ", ".join(bad[:3]))
         if not targets:
             raise HTTPException(400, "Nhập ít nhất một từ khóa, link bài hoặc tài khoản")
+        quality = QualityFilter(
+            max_age_days=req.max_age_days, min_likes=req.min_likes, min_replies=req.min_replies,
+            min_chars=QualityFilter.min_chars if req.clean else 0, skip_ads=req.clean,
+        )
         opts = CrawlOptions(
-            limit=req.limit, replies=req.replies, min_likes=req.min_likes, recent=req.recent,
+            limit=req.limit, replies=req.replies, branches=req.branches, expand_pages=req.expand_pages, tabs=req.tabs, quality=quality,
             media=req.media, headless=not req.show_browser, profile=profile,
         )
 
@@ -124,19 +187,44 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
                 stats = asyncio.run(crawl(job_store, targets, opts, progress))
             finally:
                 job_store.close()
-            return {"posts": stats.posts, "replies": stats.replies, "errors": stats.errors}
+            return {"posts": stats.posts, "replies": stats.replies, "errors": stats.errors,
+                    "skipped": dict(stats.skipped.most_common())}
 
         def short(t: CrawlTarget) -> str:
             return f"🔗 {parse_post_url(t.query)[1]}" if t.kind == "post" else t.label
 
         title = ", ".join(short(t) for t in targets[:3]) + (f" +{len(targets) - 3}" if len(targets) > 3 else "")
-        return jobs.submit("crawl", f"Crawl: {title}", run)
+        kinds = {"search": "🔎", "post": "🔗", "user": "👤"}
+        detail = [f"{kinds[t.kind]} {t.query if t.kind == 'post' else t.label}" for t in targets]
+        detail.append(
+            f"⚙️ {req.limit} bài/mục, {req.replies} bình luận/bài, {req.branches} nhánh (≤{req.expand_pages} trang mở thêm), trong {req.max_age_days or '∞'} ngày, "
+            f"≥{req.min_likes} like, ≥{req.min_replies} bình luận, tab {req.tabs}"
+            + (", lọc rác" if req.clean else "")
+        )
+        return jobs.submit("crawl", f"Crawl: {title}", run, detail)
 
     # ── Kho bài ──────────────────────────────────────────────────────────────
 
     @app.get("/api/keywords")
     def keyword_suggestions():
         return keywords.suggestions(store)
+
+    @app.get("/api/sources")
+    def sources():
+        return {"sources": store.list_sources(), "suggested": store.suggest_sources()}
+
+    @app.post("/api/sources")
+    def add_source(req: SourceRequest):
+        name = parse_username(req.username)
+        if not name:
+            raise HTTPException(400, f"Tên tài khoản không hợp lệ: {req.username}")
+        store.add_source(name)
+        return {"ok": True, "username": name}
+
+    @app.delete("/api/sources/{username}")
+    def remove_source(username: str):
+        store.remove_source(username)
+        return {"ok": True}
 
     @app.get("/api/queries")
     def queries():
@@ -149,6 +237,10 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     ):
         items, total = store.list_posts(query, q, sort, limit, offset, starred)
         return {"items": [with_urls(p) for p in items], "total": total, "starred": store.count_starred()}
+
+    @app.delete("/api/posts")
+    def delete_unstarred_posts():
+        return {"ok": True, "deleted": store.delete_unstarred()}
 
     @app.put("/api/posts/{code}/star")
     def star_post(code: str, req: StarRequest):
@@ -170,6 +262,128 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
         store.delete_post(code)
         return {"ok": True}
 
+    # ── Sản phẩm ─────────────────────────────────────────────────────────────
+
+    @app.post("/api/products")
+    def create_product(req: ProductRequest):
+        try:
+            return {"code": product.create(store, req.name, req.intro, req.price, req.source, req.reviews, req.cta, req.image)}
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/products/fetch")
+    def fetch_product(req: ProductFetchRequest):
+        if not shopee.is_shopee_url(req.url):
+            raise HTTPException(400, "Chỉ nhận link shopee.vn")
+        url = req.url.strip()
+        return jobs.submit("crawl", f"Shopee: {shopee.parse_item_name(url)}",
+                           lambda progress: asyncio.run(shopee.fetch_product(url, progress)), [f"🔗 {url}"])
+
+    # ── Review Shopee ────────────────────────────────────────────────────────
+
+    reviews_dir = data_dir / "shopee_reviews"
+
+    @app.post("/api/shopee-reviews/ingest")
+    def ingest_shopee_reviews(req: IngestRequest, request: Request):
+        # Web bất kỳ trên trình duyệt cũng gọi được địa chỉ 127.0.0.1, nên chỉ nhận từ extension
+        if not request.headers.get("origin", "").startswith("chrome-extension://"):
+            raise HTTPException(403, "Chỉ nhận dữ liệu từ extension")
+        try:
+            body = json.loads(req.body)
+        except ValueError:
+            return {"rejected": True}
+        return shopee_reviews.ingest_response(reviews_dir, req.page_url, req.api_url, body)
+
+    @app.put("/api/shopee-reviews/{stem}/marks/{review_id}")
+    def mark_shopee_review(stem: str, review_id: str, req: MarkRequest):
+        if not shopee_reviews.set_mark(reviews_dir, stem, review_id, req.picked, req.claim, req.permission):
+            raise HTTPException(404, "Không tìm thấy review")
+        return {"ok": True}
+
+    @app.delete("/api/shopee-reviews/{stem}/picks")
+    def clear_shopee_picks(stem: str):
+        if shopee_reviews.picked_reviews(reviews_dir, stem) is None:
+            raise HTTPException(404, "Không tìm thấy sản phẩm")
+        shopee_reviews.clear_picks(reviews_dir, stem)
+        return {"ok": True}
+
+    @app.get("/api/shopee-reviews/{stem}/test-list.csv")
+    def shopee_test_list(stem: str):
+        rows = shopee_reviews.picked_reviews(reviews_dir, stem)
+        if rows is None:
+            raise HTTPException(404, "Không tìm thấy sản phẩm")
+        return Response(shopee_reviews.test_list_csv(rows), media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="test_{stem}.csv"'})
+
+    @app.post("/api/shopee-reviews/{stem}/download-picked")
+    def download_shopee_picked(stem: str):
+        if not shopee_reviews.picked_reviews(reviews_dir, stem):
+            raise HTTPException(400, "Chưa chọn bình luận nào")
+
+        def run(progress):
+            r = shopee_reviews.download_picked(reviews_dir, stem, progress=progress)
+            return {"kind": "shopee_reviews", "added": 0, "videos_saved": r["saved"], "videos_failed": r["failed"],
+                    "problems": r["problems"], "blocked": False}
+
+        return jobs.submit("crawl", "Review Shopee: Tải video đã chọn", run, [f"📦 {stem}"])
+
+    @app.post("/api/shopee-reviews")
+    def start_shopee_reviews(req: ShopeeReviewsRequest):
+        refs, bad = {}, []
+        for u in filter(str.strip, req.urls):
+            if ref := shopee_reviews.parse_item_ref(u):
+                refs[ref.stem] = ref
+            else:
+                bad.append(u.strip())
+        if bad:
+            raise HTTPException(400, "Không phải link sản phẩm shopee.vn có id: " + ", ".join(bad[:3]))
+        if not refs:
+            raise HTTPException(400, "Nhập ít nhất một link sản phẩm")
+        targets = list(refs.values())
+
+        def run(progress):
+            opts = shopee_reviews.Options(
+                limit=req.limit, delay=req.delay, timeout=req.timeout, retries=req.retries, refresh=req.refresh,
+                download_videos=req.download_videos or req.videos_only, videos_only=req.videos_only, progress=progress,
+            )
+            results = asyncio.run(shopee_reviews.crawl_reviews(targets, reviews_dir, opts))
+            return {
+                "kind": "shopee_reviews",
+                "products": len(targets),
+                "done": len(results),
+                "added": sum(r.added for r in results),
+                "videos_saved": sum(r.videos_saved for r in results),
+                "videos_failed": sum(r.videos_failed for r in results),
+                "problems": [f"{r.ref.stem}: {r.error}" for r in results if r.error],
+                "blocked": any(r.status == "blocked" for r in results),
+            }
+
+        action = "Tải video" if req.videos_only else "Quét"
+        detail = [f"🔗 {t.url}" for t in targets]
+        detail.append(f"⚙️ tối đa {req.limit} đánh giá/sản phẩm, nghỉ {req.delay:g} giây/trang, "
+                      f"tải video: {'có' if req.download_videos or req.videos_only else 'không'}")
+        return jobs.submit("crawl", f"Review Shopee: {action} {len(targets)} sản phẩm", run, detail)
+
+    @app.get("/api/shopee-reviews")
+    def shopee_review_products():
+        items = shopee_reviews.list_products(reviews_dir)
+        for p in items:
+            p["jsonl"], p["csv"] = media_url(p["jsonl"], data_dir), media_url(p["csv"], data_dir)
+        merged = reviews_dir / shopee_reviews.ALL_REVIEWS
+        return {"items": items, "all_jsonl": media_url(str(merged), data_dir) if merged.exists() else None,
+                "all_csv": media_url(str(merged.with_suffix(".csv")), data_dir) if merged.exists() else None}
+
+    @app.get("/api/shopee-reviews/{stem}")
+    def shopee_review_list(stem: str, page: int = 1, video_only: bool = False, rating: int = 0, q: str = "",
+                           picked_only: bool = False):
+        data = shopee_reviews.read_reviews(reviews_dir, stem, max(page, 1), 20, video_only, rating, q, picked_only)
+        if data is None:
+            raise HTTPException(404, "Không tìm thấy sản phẩm")
+        for r in data["items"]:
+            for v in r["videos"]:
+                v["local"] = media_url(v["local"], data_dir)
+        return data
+
     # ── Tạo video ────────────────────────────────────────────────────────────
 
     @app.get("/api/materials")
@@ -181,6 +395,38 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
             m |= {"key": media.detect_key_color(src), "width": info["width"], "height": info["height"],
                   "has_audio": info["has_audio"]}
         return items
+
+    @app.post("/api/materials/upload")
+    async def upload_clip(request: Request, name: str):
+        """Thêm video của người dùng vào thư viện meme, để chèn và chỉnh trong trình dựng như một meme."""
+        folder, exts = media.KINDS["memes"]
+        src = Path(name).name
+        suffix = Path(src).suffix.lower()
+        if suffix not in exts:
+            raise HTTPException(400, "Chỉ nhận video .mp4, .mov, .webm hoặc .gif")
+        dest_dir = media.MATERIALS_DIR / folder / UPLOAD_CATEGORY
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{Path(src).stem}_{n}{suffix}"
+            n += 1
+        size = 0
+        try:
+            with dest.open("wb") as f:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    if size > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, "Video quá lớn (tối đa 1GB)")
+                    f.write(chunk)
+            await asyncio.to_thread(media.probe, dest)
+        except HTTPException:
+            dest.unlink(missing_ok=True)
+            raise
+        except RuntimeError:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, "Không đọc được file video")
+        return {"path": dest.relative_to(media.MATERIALS_DIR / folder).as_posix()}
 
     @app.get("/api/materials/thumb/{kind}/{path:path}")
     def material_thumb(kind: str, path: str):
@@ -194,9 +440,13 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     @app.get("/api/materials/file/{kind}/{path:path}")
     def material_file(kind: str, path: str):
         try:
-            return FileResponse(media.safe_material(path, kind))
+            src = media.safe_material(path, kind)
         except (FileNotFoundError, KeyError):
             raise HTTPException(404)
+        # nhạc nền: bản đã chuẩn hóa độ to, giống hệt bản dùng khi xuất video
+        if kind == "music":
+            return FileResponse(media.normalized_music(src), media_type="audio/mp4")
+        return FileResponse(src)
 
     @app.get("/api/voices")
     def voices():
@@ -249,7 +499,8 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
                 job_store.close()
 
         label = project.name.strip() or project.segments[0].display_text[:40]
-        return jobs.submit("render", f"Video: {label}", run)
+        detail = [f"🎬 {len(project.segments)} thẻ, {len(project.memes)} meme"]
+        return jobs.submit("render", f"Video: {label}", run, detail)
 
     # ── Dự án đang dở ────────────────────────────────────────────────────────
 
@@ -323,6 +574,12 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
     def list_jobs():
         return jobs.list()
 
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: int):
+        if not jobs.cancel(job_id):
+            raise HTTPException(400, "Tác vụ đã xong hoặc không tồn tại")
+        return {"ok": True}
+
     @app.get("/api/jobs/{job_id}")
     def get_job(job_id: int):
         job = jobs.get(job_id)
@@ -330,10 +587,23 @@ def create_app(data_dir: Path, profile: Path = DEFAULT_PROFILE_DIR) -> FastAPI:
             raise HTTPException(404)
         return job
 
+    def warm_music() -> None:  # chuẩn hóa sẵn nhạc nền ở nền để lần nghe thử đầu không phải chờ
+        for m in media.list_materials()["music"]:
+            try:
+                media.normalized_music(media.safe_material(m["path"], "music"))
+            except (RuntimeError, FileNotFoundError) as e:
+                log.warning("Không chuẩn hóa được nhạc %s: %s", m["path"], e)
+
+    threading.Thread(target=warm_music, name="warm-music", daemon=True).start()
+
     tts.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    app.include_router(live.make_router(data_dir))
+    app.include_router(review_video.make_router(store, jobs, data_dir, lambda: code_stamp() > started_stamp,
+                                                lambda p: media_url(p, data_dir)))
+
     app.mount("/tts", StaticFiles(directory=tts.CACHE_DIR), name="tts")
     app.mount("/files", StaticFiles(directory=data_dir), name="files")
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    app.mount("/", NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="static")
     return app
 
 
@@ -357,4 +627,4 @@ def serve(data_dir: Path, profile: Path, host: str, port: int) -> None:
 
     data_dir.mkdir(parents=True, exist_ok=True)
     print(f"Mở trình duyệt: http://{host}:{port}")
-    uvicorn.run(create_app(data_dir, profile), host=host, port=port, log_level="warning")
+    uvicorn.run(create_app(data_dir, profile), host=host, port=port, log_level="warning", timeout_graceful_shutdown=2)  # luồng SSE của tab LIVE không tự đóng

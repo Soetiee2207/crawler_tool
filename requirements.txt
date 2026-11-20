@@ -1,0 +1,4 @@
+# Chỉ đủ cho lệnh shopee-reviews. Toàn bộ dự án (web, TTS, video) cài bằng `uv sync` theo pyproject.toml.
+playwright>=1.48
+httpx>=0.27
+pillow>=11.0

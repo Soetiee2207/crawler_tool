@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Ghi review Shopee",
+  "version": "0.1.0",
+  "description": "Khi được bật, lưu các đánh giá mà bạn tự xem trên Shopee vào app chạy trên máy. Không tự bấm, không tự mở trang.",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:8000/*", "https://shopee.vn/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Ghi review Shopee" },
+  "content_scripts": [
+    { "matches": ["https://shopee.vn/*"], "js": ["hook.js"], "world": "MAIN", "run_at": "document_start" },
+    { "matches": ["https://shopee.vn/*"], "js": ["bridge.js"], "run_at": "document_start" }
+  ]
+}

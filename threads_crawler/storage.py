@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .quality import HOT_SCORE_SQL
+
 log = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -36,7 +38,12 @@ CREATE TABLE IF NOT EXISTS posts (
     media_json TEXT,           -- [{"type","url","path"}]
     crawled_at TEXT DEFAULT (datetime('now')),
     used INTEGER DEFAULT 0,    -- đánh dấu đã dùng làm video
-    starred INTEGER DEFAULT 0  -- bài yêu thích (gắn sao) để làm content sau
+    starred INTEGER DEFAULT 0, -- bài yêu thích (gắn sao) để làm content sau
+    rank INTEGER,              -- bình luận: thứ tự hiển thị trên Threads (NULL = dữ liệu cũ)
+    thread_code TEXT,          -- bình luận: mã bình luận gốc của mạch; = parent_code nếu là phần tác giả viết tiếp
+    depth INTEGER DEFAULT 0,   -- bình luận: 0 = bình luận gốc / viết tiếp, 1 = trả lời, 2 = trả lời của trả lời...
+    reply_parent TEXT,         -- bình luận: mã bình luận nó trả lời (NULL = trả lời bài)
+    badge TEXT                 -- đánh giá sản phẩm: số sao và nguồn, hiện trên đầu thẻ
 );
 CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(parent_code);
 CREATE INDEX IF NOT EXISTS idx_posts_query ON posts(query);
@@ -75,11 +82,22 @@ CREATE TABLE IF NOT EXISTS done_posts (
     video_id INTEGER,
     done_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Tài khoản nguồn: chuyên đăng đúng mảng content, crawl đều đặn để luôn có bài mới.
+CREATE TABLE IF NOT EXISTS sources (
+    username TEXT PRIMARY KEY,
+    added_at TEXT DEFAULT (datetime('now')),
+    last_crawled TEXT
+);
 """
 
 # Cột thêm sau phiên bản đầu; DB cũ được bổ sung khi mở.
 MIGRATIONS = {
-    "posts": {"reply_to_username": "TEXT", "avatar_path": "TEXT", "starred": "INTEGER DEFAULT 0"},
+    "posts": {
+        "reply_to_username": "TEXT", "avatar_path": "TEXT", "starred": "INTEGER DEFAULT 0",
+        "rank": "INTEGER", "thread_code": "TEXT", "depth": "INTEGER DEFAULT 0", "reply_parent": "TEXT",
+        "badge": "TEXT",
+    },
     "videos": {"publish_at": "TEXT"},
 }
 
@@ -147,18 +165,21 @@ class Store:
             return
         # Giữ lại đường dẫn media đã tải, trạng thái đã dùng và sao nếu post được crawl lại.
         old = self.db.execute(
-            "SELECT media_json, used, avatar_path, starred FROM posts WHERE code = ?", (post["code"],)
+            "SELECT text, media_json, used, avatar_path, starred FROM posts WHERE code = ?", (post["code"],)
         ).fetchone()
         if old:
             old_paths = {m["url"]: m.get("path") for m in json.loads(old["media_json"] or "[]")}
             for m in post["media"]:
                 m.setdefault("path", old_paths.get(m["url"]))
+            # Kết quả search có thể chỉ có text bị cắt; bản đã lưu (từ trang chi tiết) đầy đủ hơn.
+            if len(old["text"] or "") > len(post["text"]):
+                post = {**post, "text": old["text"]}
         self.db.execute(
             """INSERT OR REPLACE INTO posts
                (code, id, url, username, user_verified, text, published_at, like_count, reply_count,
                 repost_count, quote_count, parent_code, reply_to_username, query, avatar_path,
-                media_json, used, starred)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                media_json, used, starred, rank, thread_code, depth, reply_parent, badge)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 post["code"], post["id"], post["url"], post["username"], int(post["user_verified"]),
                 post["text"], post["published_at"], post["like_count"], post["reply_count"],
@@ -166,6 +187,7 @@ class Store:
                 post.get("avatar_path") or (old["avatar_path"] if old else None),
                 json.dumps(post["media"], ensure_ascii=False), old["used"] if old else 0,
                 (old["starred"] or 0) if old else 0,
+                post.get("rank"), post.get("thread_code"), post.get("depth") or 0, post.get("reply_parent"), post.get("badge"),
             ),
         )
         self.db.commit()
@@ -199,8 +221,27 @@ class Store:
         dest.write_bytes(resp.content)
         return True
 
+    def has_replies(self, code: str) -> bool:
+        """Đã có bình luận crawl theo cách mới (có thứ tự); dữ liệu cũ lộn xộn thì crawl lại."""
+        return self.db.execute(
+            "SELECT 1 FROM posts WHERE parent_code = ? AND rank IS NOT NULL LIMIT 1", (code,)
+        ).fetchone() is not None
+
+    def replace_replies(self, parent_code: str, keep: set[str]) -> None:
+        """Bỏ các bình luận cũ của bài không còn trong lần crawl mới (kèm ảnh đã tải)."""
+        for (code,) in self.db.execute("SELECT code FROM posts WHERE parent_code = ?", (parent_code,)).fetchall():
+            if code not in keep:
+                shutil.rmtree(self.media_dir / code, ignore_errors=True)
+                self.db.execute("DELETE FROM posts WHERE code = ?", (code,))
+        self.db.commit()
+
     def is_done(self, code: str) -> bool:
         return self.db.execute("SELECT 1 FROM done_posts WHERE code = ?", (code,)).fetchone() is not None
+
+    def undo_done(self, code: str) -> None:
+        """Bỏ đánh dấu "đã làm video" để crawl lại được bài này (dán link thẳng vào)."""
+        self.db.execute("DELETE FROM done_posts WHERE code = ?", (code,))
+        self.db.commit()
 
     def archive_used(self, codes: list[str], video_id: int | None = None) -> None:
         """Bài đã làm video: ghi vào done_posts rồi xóa khỏi kho (cả bình luận và ảnh/video đã tải)."""
@@ -221,6 +262,15 @@ class Store:
             shutil.rmtree(self.media_dir / c, ignore_errors=True)
         self.db.execute("DELETE FROM posts WHERE code = ? OR parent_code = ?", (code, code))
         self.db.commit()
+
+    def delete_unstarred(self) -> int:
+        """Xóa mọi bài gốc chưa gắn sao (kèm bình luận, ảnh/video) để crawl lại; giữ nguyên bài yêu thích."""
+        codes = [r[0] for r in self.db.execute(
+            "SELECT code FROM posts WHERE parent_code IS NULL AND COALESCE(starred, 0) = 0"
+        )]
+        for code in codes:
+            self.delete_post(code)
+        return len(codes)
 
     def set_starred(self, code: str, starred: bool) -> None:
         self.db.execute("UPDATE posts SET starred = ? WHERE code = ? AND parent_code IS NULL", (int(starred), code))
@@ -261,6 +311,7 @@ class Store:
             "replies": "reply_count DESC",
             "newest": "published_at DESC",
             "crawled": "crawled_at DESC",
+            "hot": f"{HOT_SCORE_SQL} DESC",
         }.get(sort, "like_count DESC")
         sql_where = " AND ".join(where)
         total = self.db.execute(f"SELECT COUNT(*) FROM posts WHERE {sql_where}", args).fetchone()[0]
@@ -271,6 +322,46 @@ class Store:
         )
         return [_row_to_post(r) for r in rows], total
 
+    # ── Tài khoản nguồn ───────────────────────────────────────────────────────
+
+    def list_sources(self) -> list[dict]:
+        """Tài khoản nguồn kèm số bài đang trong kho, số bài ≤ 14 ngày, like TB và số bài đã làm video."""
+        rows = self.db.execute(
+            """SELECT s.username, s.added_at, s.last_crawled,
+                      COUNT(p.code) AS posts,
+                      SUM(julianday('now') - julianday(p.published_at) <= 14) AS fresh,
+                      CAST(AVG(p.like_count) AS INTEGER) AS avg_likes,
+                      (SELECT COUNT(*) FROM done_posts d WHERE d.username = s.username) AS used
+               FROM sources s LEFT JOIN posts p ON p.username = s.username AND p.parent_code IS NULL
+               GROUP BY s.username ORDER BY s.added_at DESC"""
+        )
+        return [dict(r) | {"fresh": r["fresh"] or 0} for r in rows]
+
+    def add_source(self, username: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO sources (username) VALUES (?)", (username,))
+        self.db.commit()
+
+    def remove_source(self, username: str) -> None:
+        self.db.execute("DELETE FROM sources WHERE username = ?", (username,))
+        self.db.commit()
+
+    def touch_source(self, username: str) -> None:
+        self.db.execute("UPDATE sources SET last_crawled = datetime('now') WHERE username = ?", (username,))
+        self.db.commit()
+
+    def suggest_sources(self, limit: int = 12) -> list[dict]:
+        """Tác giả hay xuất hiện với bài like cao (tính cả bài đã làm video) mà chưa là nguồn."""
+        rows = self.db.execute(
+            """SELECT username, COUNT(*) AS posts, CAST(AVG(like_count) AS INTEGER) AS avg_likes
+               FROM (SELECT username, like_count FROM posts WHERE parent_code IS NULL
+                     UNION ALL SELECT username, like_count FROM done_posts WHERE username IS NOT NULL)
+               WHERE username NOT IN (SELECT username FROM sources)
+               GROUP BY username HAVING avg_likes >= 1000
+               ORDER BY posts DESC, avg_likes DESC LIMIT ?""",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
     def get_post(self, code: str) -> dict | None:
         row = self.db.execute("SELECT * FROM posts WHERE code = ?", (code,)).fetchone()
         if not row:
@@ -279,7 +370,7 @@ class Store:
         post["replies"] = [
             _row_to_post(r)
             for r in self.db.execute(
-                "SELECT * FROM posts WHERE parent_code = ? ORDER BY published_at ASC", (code,)
+                "SELECT * FROM posts WHERE parent_code = ? ORDER BY rank IS NULL, rank, published_at", (code,)
             )
         ]
         return post

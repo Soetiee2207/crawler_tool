@@ -56,6 +56,9 @@ function showTab(name) {
   $$(".tab").forEach((t) => t.classList.toggle("active", t.id === "tab-" + name));
   if (name === "library") loadPosts();
   if (name === "videos") loadVideos();
+  if (name === "shopee") window.ShopeeTab?.refresh();
+  if (name === "studio") window.ReviewStudio?.refresh();
+  else window.ReviewStudio?.pause();
   if (name === "create") Editor.onShow();
   else Editor.pause();
   updatePickBar();
@@ -79,41 +82,138 @@ async function pollJobs() {
   const active = jobs.filter((j) => j.status === "queued" || j.status === "running");
   $("#jobsBadge").textContent = active.length;
   $("#jobsBadge").classList.toggle("hidden", !active.length);
-  $("#jobsPanel").innerHTML = jobs.length ? jobs.map(jobHtml).join("") : '<p class="muted small">Chưa có tác vụ nào.</p>';
+  renderJobs(jobs);
+  renderJobNow(active);
   for (const j of jobs) {
-    if ((j.status === "done" || j.status === "error") && !seenDone.has(j.id)) {
+    if (["done", "error", "cancelled"].includes(j.status) && !seenDone.has(j.id)) {
       seenDone.add(j.id);
       if (!firstPoll) onJobFinished(j);
     }
   }
   firstPoll = false;
   Editor.onJobs(jobs);
+  window.ShopeeTab?.onJobs(jobs);
   jobsTimer = setTimeout(pollJobs, active.length ? 1200 : 4000);
 }
 
-function jobHtml(j) {
-  const pct = Math.round(j.progress * 100);
-  const status = { queued: "Chờ", running: pct + "%", done: "✓ Xong", error: "✕ Lỗi" }[j.status];
-  return `<div class="job">
-    <div class="job-title"><span>${esc(j.title)}</span><span class="muted">${status}</span></div>
-    <div class="job-msg ${j.status === "error" ? "error" : ""}">${esc(j.error || j.message)}</div>
-    ${j.status === "running" || j.status === "queued" ? `<div class="progress"><div style="width:${pct}%"></div></div>` : ""}
-  </div>`;
+// Bảng tác vụ cập nhật tại chỗ (không vẽ lại cả bảng mỗi lần hỏi tiến độ) để nút Dừng bấm được,
+// phần chi tiết đang mở và vị trí cuộn nhật ký không bị mất.
+const openJobs = new Set();
+const isActive = (j) => j.status === "queued" || j.status === "running";
+const clock = (t) => new Date(t * 1000).toLocaleTimeString("vi-VN", { hour12: false });
+
+function jobStatus(j) {
+  if (j.status === "running" && j.cancel_requested) return "Đang dừng…";
+  return { queued: "Đang chờ", running: Math.round(j.progress * 100) + "%", done: "✓ Xong", error: "✕ Lỗi",
+    cancelled: "⏹ Đã dừng" }[j.status];
+}
+
+function jobDetailHtml(j) {
+  const end = j.finished_at || Date.now() / 1000;
+  const mins = j.started_at ? Math.max(0, Math.round((end - j.started_at) / 60)) : 0;
+  const r = j.result || {};
+  const skipped = Object.entries(r.skipped || {}).map(([why, n]) => `${n} ${why}`).join(", ");
+  return `<div class="muted">Tạo lúc ${clock(j.created_at)}${j.started_at ? ` · bắt đầu ${clock(j.started_at)} · ${mins} phút` : ""}</div>
+    ${j.detail.length ? `<ul>${j.detail.map((d) => `<li>${esc(d)}</li>`).join("")}</ul>` : ""}
+    ${r.kind === "shopee_reviews" ? `<div>Kết quả: thêm ${r.added} đánh giá, tải ${r.videos_saved} video${r.videos_failed ? `, lỗi ${r.videos_failed} video` : ""}</div>
+      ${r.problems.map((e) => `<div class="job-msg error">${esc(e)}</div>`).join("")}` : ""}
+    ${j.kind === "crawl" && j.status === "done" && r.kind !== "shopee_reviews" ? `<div>Kết quả: ${r.posts} bài, ${r.replies} bình luận${skipped ? ` · đã loại ${esc(skipped)}` : ""}</div>
+      ${(r.errors || []).map((e) => `<div class="job-msg error">${esc(e)}</div>`).join("")}` : ""}
+    <div class="job-log">${j.log.map(([t, m]) => `${clock(t)}  ${esc(m)}`).join("\n") || "Chưa chạy"}</div>`;
+}
+
+function renderJobs(jobs) {
+  const panel = $("#jobsPanel");
+  if (!jobs.length) {
+    panel.innerHTML = '<p class="muted small">Chưa có tác vụ nào.</p>';
+    return;
+  }
+  panel.querySelector(":scope > p")?.remove();
+  const ids = new Set(jobs.map((j) => String(j.id)));
+  $$(".job", panel).forEach((el) => ids.has(el.dataset.job) || el.remove());
+  jobs.forEach((j, i) => {
+    let el = $(`.job[data-job="${j.id}"]`, panel);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "job";
+      el.dataset.job = j.id;
+      el.innerHTML = `<div class="job-title" data-togglejob title="Bấm để xem chi tiết"><span class="t"></span><span class="st muted"></span></div>
+        <div class="job-msg"></div>
+        <div class="job-bar"><div class="progress"><div></div></div>
+          <button class="sm danger stop" data-canceljob="${j.id}">⏹ Dừng</button></div>
+        <div class="job-detail"></div>`;
+    }
+    if (panel.children[i] !== el) panel.insertBefore(el, panel.children[i] || null);
+    $(".t", el).textContent = j.title;
+    $(".st", el).textContent = jobStatus(j);
+    const msg = $(".job-msg", el);
+    msg.textContent = j.error || j.message;
+    msg.classList.toggle("error", j.status === "error");
+    $(".job-bar", el).classList.toggle("hidden", !isActive(j));
+    $(".progress > div", el).style.width = Math.round(j.progress * 100) + "%";
+    $(".stop", el).classList.toggle("hidden-btn", !isActive(j) || j.cancel_requested);
+    el.classList.toggle("open", openJobs.has(j.id));
+    if (openJobs.has(j.id)) {
+      const old = $(".job-log", el);
+      const atBottom = !old || old.scrollTop + old.clientHeight >= old.scrollHeight - 4;
+      const top = old?.scrollTop;
+      $(".job-detail", el).innerHTML = jobDetailHtml(j);
+      const log = $(".job-log", el);
+      log.scrollTop = atBottom ? log.scrollHeight : top;
+    }
+  });
+}
+
+let runningJobId = null;
+function renderJobNow(active) {
+  const run = active.find((j) => j.status === "running");
+  const waiting = active.filter((j) => j.status === "queued").length;
+  $("#jobNow").classList.toggle("hidden", !run);
+  runningJobId = run?.id ?? null;
+  if (!run) return;
+  $("#jobNow .t").textContent = `${run.title} — ${run.message}`;
+  $("#jobNow .pct").textContent = jobStatus(run);
+  $("#jobNow .q").textContent = waiting ? `+${waiting} chờ` : "";
+  $("#jobNow .stop").classList.toggle("hidden-btn", run.cancel_requested);
+}
+
+async function cancelJob(id) {
+  if (!confirm("Dừng tác vụ này? Phần đã crawl xong vẫn được giữ trong kho.")) return;
+  try {
+    await api(`/api/jobs/${id}/cancel`, { method: "POST" });
+    toast("Đang dừng tác vụ… (dừng sau bước hiện tại)");
+    pollJobs();
+  } catch (err) { toast(err.message, true); }
 }
 
 function onJobFinished(j) {
+  if (j.title.startsWith("Review Shopee")) window.ShopeeTab?.refresh();
+  if (j.result?.kind === "shopee_reviews") {
+    const r = j.result;
+    const text = `Thêm ${r.added} đánh giá, tải ${r.videos_saved} video` + (r.videos_failed ? `, lỗi ${r.videos_failed} video` : "");
+    return r.blocked ? toast(`Shopee đã chặn nên tool dừng lại. ${text}. Phần đã lấy được vẫn còn, hãy chạy lại sau.`, true)
+      : toast(r.problems.length ? `${text}. Có ${r.problems.length} sản phẩm lỗi, xem ở mục Tác vụ.` : `Xong: ${text}.`, r.problems.length > 0);
+  }
   if (j.status === "error") return toast(`${j.title}: ${j.error}`, true);
+  if (j.status === "cancelled") {
+    toast(`Đã hủy: ${j.title}`);
+    if (j.kind === "crawl") { loadQueries(); Editor.refreshPosts(); }
+    if ($("#tab-library").classList.contains("active")) loadPosts();
+    return;
+  }
   if (j.kind === "crawl") {
     const r = j.result || {};
-    toast(`Crawl xong: ${r.posts} bài, ${r.replies} bình luận` + (r.errors?.length ? ` (${r.errors.length} lỗi)` : ""));
+    const skipped = Object.entries(r.skipped || {}).map(([why, n]) => `${n} ${why}`).join(", ");
+    toast(`Crawl xong: ${r.posts} bài, ${r.replies} bình luận` + (r.errors?.length ? ` (${r.errors.length} lỗi)` : "") +
+      (skipped ? `. Đã loại: ${skipped}` : ""));
     loadQueries();
-    loadSuggestions();
+    loadSources();
+    Editor.refreshPosts();
     if ($("#tab-library").classList.contains("active")) loadPosts();
   } else {
-    toast("Đã xuất video! Các bài đã dùng được xóa khỏi kho. Xem video ở tab Video đã xuất.");
+    toast("Đã xuất video! Xem video ở tab Video đã xuất.");
     loadVideos();
     loadQueries();
-    loadSuggestions();
     if ($("#tab-library").classList.contains("active")) loadPosts();
   }
 }
@@ -125,99 +225,128 @@ $("#jobsBtn").onclick = (e) => {
 document.addEventListener("click", (e) => {
   if (!e.target.closest(".jobs-wrap")) $("#jobsPanel").classList.add("hidden");
 });
+$("#jobsPanel").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-canceljob]");
+  if (btn) return cancelJob(+btn.dataset.canceljob);
+  const head = e.target.closest("[data-togglejob]");
+  if (!head) return;
+  const id = +head.closest(".job").dataset.job;
+  openJobs.has(id) ? openJobs.delete(id) : openJobs.add(id);
+  pollJobs();
+});
+$("#jobNow .stop").onclick = () => runningJobId && cancelJob(runningJobId);
+$("#jobNow .t").onclick = (e) => {
+  e.stopPropagation();
+  if (runningJobId) openJobs.add(runningJobId);
+  $("#jobsPanel").classList.remove("hidden");
+  pollJobs();
+};
 
 // ───────────────────────── Crawl ─────────────────────────
-
-function customKeywords() {
-  return $("#customKeywords").value.split("\n").map((s) => s.trim()).filter(Boolean);
-}
 
 const lines = (sel) => $(sel).value.split("\n").map((s) => s.trim()).filter(Boolean);
 
 function updateCrawlSummary() {
-  const parts = [[customKeywords().length, "từ khóa"], [lines("#crawlUrls").length, "link bài"], [lines("#crawlUsers").length, "tài khoản"]]
+  const parts = [[lines("#crawlUrls").length, "link bài"], [lines("#crawlUsers").length, "tài khoản"]]
     .filter(([n]) => n).map(([n, what]) => `${n} ${what}`);
   $("#crawlSummary").textContent = parts.length ? `Sẽ crawl ${parts.join(", ")}` : "Chưa nhập gì để crawl";
-  const added = new Set(customKeywords().map((k) => k.toLowerCase()));
-  $$("#tab-crawl [data-kw]").forEach((c) => c.classList.toggle("added", added.has(c.dataset.kw.toLowerCase())));
+  const users = new Set(lines("#crawlUsers").map(userKey));
+  $$("#tab-crawl [data-user]").forEach((c) => c.classList.toggle("added", users.has(c.dataset.user.toLowerCase())));
 }
 
-function toggleKeyword(kw, on) {
-  const list = customKeywords();
-  const has = list.some((k) => k.toLowerCase() === kw.toLowerCase());
-  if (on ?? !has) {
-    if (!has) list.push(kw);
+// "@Ten", "ten", "https://www.threads.com/@ten" -> "ten"
+const userKey = (s) => (s.match(/@([\w.]+)/)?.[1] ?? s).replace(/^@/, "").toLowerCase();
+
+function toggleUser(name, on) {
+  const list = lines("#crawlUsers");
+  const i = list.findIndex((u) => userKey(u) === name.toLowerCase());
+  if (on ?? i < 0) {
+    if (i < 0) list.push("@" + name);
   } else {
-    list.splice(list.findIndex((k) => k.toLowerCase() === kw.toLowerCase()), 1);
+    list.splice(i, 1);
   }
-  $("#customKeywords").value = list.join("\n");
+  $("#crawlUsers").value = list.join("\n");
   updateCrawlSummary();
 }
 
-// ── Gợi ý từ khóa ──
+// ── Tài khoản nguồn ──
 
-let suggest = { groups: [], from_data: [], performance: [] };
-let suggestGroup = store.get("suggestGroup", 0);
+let sources = { sources: [], suggested: [] };
 
-async function loadSuggestions() {
-  try { suggest = await api("/api/keywords"); } catch { return; }
-  renderSuggestions();
+async function loadSources() {
+  try { sources = await api("/api/sources"); } catch { return; }
+  renderSources();
 }
 
-function kwChip(kw, extra = "") {
-  return `<span class="chip" data-kw="${esc(kw)}">${esc(kw)}${extra}</span>`;
+// datetime('now') của sqlite là giờ UTC không kèm múi giờ
+function ago(sqlTime) {
+  if (!sqlTime) return "chưa crawl";
+  const h = (Date.now() - new Date(sqlTime.replace(" ", "T") + "Z")) / 36e5;
+  return h < 1 ? "vừa xong" : h < 24 ? `${Math.floor(h)} giờ trước` : `${Math.floor(h / 24)} ngày trước`;
 }
 
-function renderSuggestions() {
-  const g = suggest.groups[suggestGroup] || suggest.groups[0];
-  $("#suggestTabs").innerHTML = suggest.groups.map((x, i) =>
-    `<button class="${i === suggestGroup ? "active" : ""}" data-group="${i}">${x.emoji} ${esc(x.name)}</button>`).join("");
-  $("#suggestBody").innerHTML = g
-    ? g.keywords.map((k) => kwChip(k.keyword, k.crawled ? `<span class="done" title="Đã crawl ${k.crawled} bài">✓${k.crawled}</span>` : "")).join("") +
-      `<button class="ghost sm" data-addgroup>+ Thêm cả nhóm</button>`
-    : "";
-  $("#suggestData").innerHTML = suggest.from_data.length
-    ? suggest.from_data.map((d) => kwChip(d.keyword, `<span class="cnt">${d.count}</span>`)).join("")
-    : '<span class="muted small">Crawl thêm để có gợi ý từ dữ liệu thật.</span>';
-  const maxAvg = Math.max(1, ...suggest.performance.map((p) => p.avg_likes));
-  $("#suggestPerf").innerHTML = suggest.performance.length ? `<table class="perf">
-    <tr><th>Từ khóa</th><th class="num">Bài</th><th class="num">Like TB</th><th class="num">Cao nhất</th><th class="num">Đã làm</th></tr>
-    ${suggest.performance.map((p) => `<tr>
-      <td><span class="chip" data-kw="${esc(p.query)}" title="Bấm để crawl lại">${esc(p.query)}</span>
-        <div class="bar" style="width:${Math.round((p.avg_likes / maxAvg) * 100)}%"></div></td>
-      <td class="num">${p.posts}</td><td class="num">${fmt(p.avg_likes)}</td><td class="num">${fmt(p.max_likes)}</td><td class="num">${p.used}</td></tr>`).join("")}
-  </table>` : '<span class="muted small">Chưa crawl từ khóa nào.</span>';
+function renderSources() {
+  $("#sourceList").innerHTML = sources.sources.length ? `<table class="perf">
+    <tr><th>Tài khoản</th><th class="num" title="Bài trong kho (đăng trong 14 ngày)">Trong kho</th>
+      <th class="num">Like TB</th><th class="num">Đã làm</th><th>Crawl lần cuối</th><th></th></tr>
+    ${sources.sources.map((s) => `<tr>
+      <td><span class="chip" data-user="${esc(s.username)}">@${esc(s.username)}</span></td>
+      <td class="num">${s.posts} (${s.fresh})</td><td class="num">${s.avg_likes == null ? "–" : fmt(s.avg_likes)}</td>
+      <td class="num">${s.used}</td><td class="muted">${ago(s.last_crawled)}</td>
+      <td><span class="x" data-unsource="${esc(s.username)}" title="Bỏ khỏi nguồn">✕</span></td></tr>`).join("")}
+  </table>` : '<span class="muted small">Chưa có nguồn nào. Thêm tên tài khoản ở trên, chọn từ gợi ý, hoặc bấm 👤+ trên bài trong Kho bài.</span>';
+  $("#sourceSuggest").innerHTML = sources.suggested.length
+    ? sources.suggested.map((s) => `<span class="chip" data-addsource="${esc(s.username)}"
+        title="${s.posts} bài, like TB ${fmt(s.avg_likes)}. Bấm để thêm làm nguồn">+ @${esc(s.username)}<span class="cnt">${s.posts}</span></span>`).join("")
+    : '<span class="muted small">Crawl thêm để có gợi ý.</span>';
   updateCrawlSummary();
 }
 
-$("#tab-crawl").addEventListener("click", (e) => {
-  const tab = e.target.closest("[data-group]");
-  if (tab) {
-    suggestGroup = +tab.dataset.group;
-    store.set("suggestGroup", suggestGroup);
-    return renderSuggestions();
+async function addSource(username) {
+  try {
+    const r = await api("/api/sources", { method: "POST", body: { username } });
+    toast(`Đã thêm @${r.username} vào tài khoản nguồn`);
+    loadSources();
+    return true;
+  } catch (e) { toast(e.message, true); }
+}
+
+$("#sourceAdd").onclick = async () => {
+  const v = $("#sourceInput").value.trim();
+  if (v && await addSource(v)) $("#sourceInput").value = "";
+};
+$("#sourceInput").onkeydown = (e) => { if (e.key === "Enter") $("#sourceAdd").click(); };
+$("#addAllSources").onclick = () => sources.sources.forEach((s) => toggleUser(s.username, true));
+
+$("#tab-crawl").addEventListener("click", async (e) => {
+  const user = e.target.closest("[data-user]");
+  if (user) return toggleUser(user.dataset.user);
+  const add = e.target.closest("[data-addsource]");
+  if (add) return addSource(add.dataset.addsource);
+  const un = e.target.closest("[data-unsource]");
+  if (un) {
+    if (!confirm(`Bỏ @${un.dataset.unsource} khỏi tài khoản nguồn?`)) return;
+    await api(`/api/sources/${encodeURIComponent(un.dataset.unsource)}`, { method: "DELETE" });
+    return loadSources();
   }
-  if (e.target.closest("[data-addgroup]")) {
-    suggest.groups[suggestGroup].keywords.forEach((k) => toggleKeyword(k.keyword, true));
-    return;
-  }
-  const chip = e.target.closest("[data-kw]");
-  if (chip) toggleKeyword(chip.dataset.kw);
 });
-$("#customKeywords").oninput = $("#crawlUrls").oninput = $("#crawlUsers").oninput = updateCrawlSummary;
+$("#crawlUrls").oninput = $("#crawlUsers").oninput = updateCrawlSummary;
 
 $("#startCrawl").onclick = async () => {
   try {
     const job = await api("/api/crawl", {
       method: "POST",
       body: {
-        keywords: customKeywords(),
         urls: lines("#crawlUrls"),
         users: lines("#crawlUsers"),
         limit: +$("#optLimit").value,
         replies: +$("#optReplies").value,
+        expand_pages: +$("#optExpandPages").value,
+        branches: +$("#optBranches").value,
         min_likes: +$("#optMinLikes").value,
-        recent: $("#optRecent").checked,
+        min_replies: +$("#optMinReplies").value,
+        max_age_days: +$("#optMaxAge").value,
+        clean: $("#optClean").checked,
         media: $("#optMedia").checked,
         show_browser: $("#optShow").checked,
       },
@@ -229,12 +358,8 @@ $("#startCrawl").onclick = async () => {
 
 async function loadQueries() {
   state.queries = await api("/api/queries");
-  $("#recentQueries").innerHTML = state.queries.length
-    ? '<span class="muted small">Đã crawl:</span>' + state.queries.map((q) =>
-      `<span class="chip" data-kw="${esc(q.query)}">${esc(q.query)}<span class="cnt">${q.count}</span></span>`).join("")
-    : "";
   const cur = $("#fQuery").value;
-  $("#fQuery").innerHTML = '<option value="">Tất cả từ khóa</option>' +
+  $("#fQuery").innerHTML = '<option value="">Tất cả nguồn</option>' +
     state.queries.map((q) => `<option>${esc(q.query)}</option>`).join("");
   $("#fQuery").value = cur;
 }
@@ -295,6 +420,7 @@ function postCardHtml(p) {
       <button class="primary" data-act="make">🎬 Làm video</button>
       <button data-act="view">Xem</button>
       <a href="${esc(p.url)}" target="_blank" rel="noopener"><button>Threads ↗</button></a>
+      <button data-act="follow" title="Thêm @${esc(p.username)} vào tài khoản nguồn">👤+</button>
       <button class="danger" data-act="del" title="Xóa">🗑</button>
     </div>
   </div>`;
@@ -326,6 +452,18 @@ $("#fStarred").onclick = () => {
   loadPosts();
 };
 
+$("#clearPosts").onclick = async () => {
+  if (!confirm("Xóa TẤT CẢ bài trong kho (kèm bình luận, ảnh/video)?\nBài đã lưu Yêu thích ★ sẽ được giữ lại.")) return;
+  try {
+    const { deleted } = await api("/api/posts", { method: "DELETE" });
+    state.pick.clear();
+    updatePickBar();
+    await loadQueries();
+    loadPosts();
+    toast(`Đã xóa ${deleted} bài, giữ lại bài yêu thích.`);
+  } catch (e) { toast(e.message, true); }
+};
+
 $("#postsGrid").onclick = async (e) => {
   const btn = e.target.closest("[data-act]");
   if (!btn) return;
@@ -339,6 +477,7 @@ $("#postsGrid").onclick = async (e) => {
   if (btn.dataset.act === "star") return toggleStar(code, btn);
   if (btn.dataset.act === "make") Editor.createFromPosts([code]);
   if (btn.dataset.act === "view") openDrawer(code);
+  if (btn.dataset.act === "follow") addSource(state.posts.find((p) => p.code === code).username);
   if (btn.dataset.act === "del" && confirm("Xóa bài này và bình luận của nó khỏi kho?")) {
     await api(`/api/posts/${code}`, { method: "DELETE" });
     state.pick.delete(code);
@@ -395,13 +534,21 @@ async function openDrawer(code) {
 $("#drawerClose").onclick = () => $("#drawer").classList.add("hidden");
 $("#drawer").onclick = (e) => { if (e.target.id === "drawer") $("#drawer").classList.add("hidden"); };
 
+// Phần tác giả viết tiếp bài (khác tác giả trả lời người bình luận). Dữ liệu cũ chưa có thread_code.
+const isSelfThread = (r, post) => (r.thread_code ? r.thread_code === post.code : r.username === post.username);
+
+// Cây bình luận theo thứ tự đọc trên Threads: mỗi tầng trả lời thụt vào thêm một nấc (tối đa 6 nấc).
 function replyHtml(r, post, order = 0) {
-  const self = r.username === post.username;
-  return `<div class="reply ${order ? "on" : ""}" data-reply="${esc(r.code)}">
+  const self = isSelfThread(r, post);
+  const depth = Math.min(r.depth || 0, 6);
+  return `<div class="reply ${order ? "on" : ""} ${depth ? "sub" : ""}" data-reply="${esc(r.code)}"
+    style="${depth ? `margin-left:${depth * 18}px` : ""}" ${r.depth > 6 ? `title="Tầng ${r.depth}"` : ""}>
     ${order !== null ? `<div class="order">${order || ""}</div>` : ""}
     <div class="body">
-      <b>${esc(r.username)}</b>${self ? '<span class="self">tác giả viết tiếp</span>' : ""}
-      ${r.reply_to_username && !self ? `<span class="muted small"> → @${esc(r.reply_to_username)}</span>` : ""}
+      <b>${esc(r.username)}</b>${self ? '<span class="self">tác giả viết tiếp</span>'
+        : r.reply_parent && r.reply_to_username === r.username ? '<span class="self">viết tiếp</span>'
+        : r.username === post.username ? '<span class="self">tác giả</span>' : ""}
+      ${r.reply_to_username && !self && r.depth ? `<span class="muted small"> → @${esc(r.reply_to_username)}</span>` : ""}
       <span class="muted small"> · ❤️ ${fmt(r.like_count)}</span>
       <p>${esc(r.text)}</p>
       ${mediaThumbsHtml(r)}
@@ -516,7 +663,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     state.materials = materials;
   } catch (e) { toast("Lỗi tải dữ liệu: " + e.message, true); }
   await Editor.init();
-  loadSuggestions();
+  loadSources();
   pollJobs();
   showTab(store.get("tab", "crawl"));
 });

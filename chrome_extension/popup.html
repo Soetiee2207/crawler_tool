@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 280px; margin: 0; padding: 14px; background: #171a21; color: #e8eaef; font: 13px/1.45 system-ui, sans-serif; }
+  label { display: flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+  input { accent-color: #fe2c55; width: 16px; height: 16px; }
+  p { margin: 8px 0 0; color: #8b93a3; }
+  #stats b { color: #e8eaef; }
+  #error { color: #ff6b81; }
+  button { margin-top: 10px; padding: 4px 10px; color: inherit; background: #1e222b; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; }
+</style>
+</head>
+<body>
+  <label><input id="enabled" type="checkbox"> Ghi review đang xem</label>
+  <p>Mở sản phẩm và tự bấm qua các trang đánh giá. Extension không tự bấm hay tự mở trang.</p>
+  <p id="stats"></p>
+  <p id="error"></p>
+  <button id="reset">Đặt lại bộ đếm</button>
+  <script src="popup.js"></script>
+</body>
+</html>

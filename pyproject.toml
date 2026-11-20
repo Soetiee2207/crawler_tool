@@ -15,6 +15,7 @@ dependencies = [
     "onnxruntime>=1.24,<1.25",  # bản mới hơn chặn external data trong HF cache (symlink blobs)
     "huggingface_hub<2",  # hub 2.x lưu blob theo thư mục con -> onnxruntime từ chối file .data
     "vieneu @ git+https://github.com/Soetiee2207/VieNeu-TTS.git",
+    "tiktoklive>=7.0.1",
 ]
 
 [project.scripts]

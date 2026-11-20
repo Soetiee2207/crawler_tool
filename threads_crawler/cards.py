@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -28,6 +29,8 @@ LINE_H = int(TEXT_SIZE * 1.4)
 POST_TEXT_W = CARD_W - 2 * PAD  # bài viết: nội dung chạy hết bề ngang dưới avatar
 COMMENT_TEXT_W = CARD_W - 2 * PAD - AVATAR - GUTTER  # bình luận: thụt vào thẳng cột tên
 MAX_CARD_H = 1320  # = dải dành cho thẻ trong khung 1920 (xem video.CARD_TOP)
+
+STAR_COLOR = (255, 196, 46, 255)
 
 THEMES = {
     "dark": {
@@ -289,6 +292,18 @@ def _icon(name: str, size: int, color: tuple) -> Image.Image:
     return img.resize((size, size), Image.LANCZOS)
 
 
+def _star(card: Image.Image, xy: tuple[float, float], size: int, color: tuple) -> None:
+    S = size * 4
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    points = [
+        (S / 2 + (S / 2 if i % 2 == 0 else S / 4.6) * math.sin(i * math.pi / 5),
+         S / 2 - (S / 2 if i % 2 == 0 else S / 4.6) * math.cos(i * math.pi / 5))
+        for i in range(10)
+    ]
+    ImageDraw.Draw(img).polygon(points, fill=color)
+    card.alpha_composite(img.resize((size, size), Image.LANCZOS), (int(xy[0]), int(xy[1])))
+
+
 def _fmt_count(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
@@ -340,6 +355,7 @@ def render_card(
     reposts: int | None = None,
     image_path: str | None = None,
     page_label: str | None = None,
+    badge: str | None = None,
     theme: str = "dark",
 ) -> Image.Image:
     """Render a card giống hệt Threads.
@@ -396,11 +412,17 @@ def render_card(
         vb = round(14 * U)
         card.alpha_composite(_verified_badge(vb), (int(x), int(name_y + (name_h - vb) / 2 + U)))
         x += vb + round(6 * U)
-    meta = relative_time(published_at)
+    meta = badge or relative_time(published_at)
     if page_label:
         meta = f"{meta} · {page_label}" if meta else page_label
     if meta:
-        d.text((x, name_y), meta, font=f_meta, fill=t["muted"])
+        stars = len(meta) - len(meta.lstrip("★☆"))
+        for i, ch in enumerate(meta[:stars]):  # font chữ không có ký tự sao nên tự vẽ
+            size = round(TEXT_SIZE * 0.8)
+            _star(card, (x + i * (size + 3), name_y + (name_h - size) / 2), size, STAR_COLOR if ch == "★" else t["muted"])
+        if stars:
+            x += stars * (round(TEXT_SIZE * 0.8) + 3) + round(2 * U)
+        d.text((x, name_y), meta[stars:], font=f_meta, fill=t["muted"])
     dots = _icon("dots", round(20 * U), t["muted"])
     card.alpha_composite(dots, (CARD_W - PAD - dots.width + round(4 * U), int(name_y + (name_h - dots.height) / 2)))
 
